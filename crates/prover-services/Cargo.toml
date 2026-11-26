@@ -1,0 +1,31 @@
+[package]
+name = "prover-services"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Sov SDK deps
+sov-rollup-interface = { path = "../sovereign-sdk/rollup-interface" }
+
+# 3rd-party deps
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+metrics = { workspace = true }
+metrics-derive = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+borsh = { workspace = true }
+tempfile = { workspace = true }
+
+sov-mock-da = { path = "../sovereign-sdk/adapters/mock-da", features = ["native"] }
+sov-mock-zkvm = { path = "../sovereign-sdk/adapters/mock-zkvm" }
+sov-rollup-interface = { path = "../sovereign-sdk/rollup-interface", features = ["testing"] }

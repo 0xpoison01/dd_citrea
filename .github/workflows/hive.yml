@@ -1,0 +1,94 @@
+# Runs `ethereum/hive` tests.
+
+name: Hive
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Docker for Hive"]
+    types:
+      - completed
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Except in `nightly` and `stable` branches! Any cancelled job will cause the
+  # CI run to fail, and we want to keep a clean history for major branches.
+  cancel-in-progress: ${{ (github.ref != 'refs/heads/nightly') && (github.ref != 'refs/heads/devnet-freeze') && (github.ref != 'refs/heads/main')}}
+
+jobs:
+  prepare:
+    timeout-minutes: 45
+    runs-on: ubicloud-standard-4
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: mkdir artifacts
+
+      - name: Checkout hive tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: chainwayxyz/hive
+          ref: main
+          path: hivetests
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "^1.13.1"
+      - run: go version
+      - name: Build hive tool
+        run: |
+          cd hivetests
+          go build .
+          mv ./hive ../artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts
+          path: ./artifacts
+
+  test:
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+
+    needs: prepare
+    name: run
+    runs-on: ubicloud-standard-8
+    permissions:
+      issues: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: artifacts
+          path: /tmp
+
+      - name: Move hive binary
+        run: |
+          mv /tmp/hive /usr/local/bin
+          chmod +x /usr/local/bin/hive
+
+      - name: Checkout hive tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: chainwayxyz/hive
+          ref: main
+          path: hivetests
+
+      - name: Run ethereum/rpc simulator
+        run: |
+          cd hivetests
+          hive --sim "ethereum/rpc" --sim.limit "/http" --client citrea
+
+      - name: Print simulator output
+        if: ${{ failure() }}
+        run: |
+          cat hivetests/workspace/logs/*simulator*.log
+
+      - name: Print citrea client logs
+        if: ${{ failure() }}
+        run: |
+          cat hivetests/workspace/logs/citrea/client-*.log

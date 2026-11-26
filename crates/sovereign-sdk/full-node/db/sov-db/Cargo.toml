@@ -1,0 +1,46 @@
+[package]
+name = "sov-db"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = "Apache-2.0" # This license is inherited from Aptos
+repository = { workspace = true }
+description = "A high-level DB interface for the Sovereign SDK"
+
+version = { workspace = true }
+readme = "README.md"
+resolver = "2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Maintained by sovereign labs
+jmt = { workspace = true }
+sov-rollup-interface = { path = "../../../rollup-interface", features = ["native"] }
+sov-schema-db = { path = "../sov-schema-db" }
+
+# External
+alloy-primitives = { workspace = true, features=["serde"] }
+anyhow = { workspace = true, default-features = true }
+bincode = { workspace = true }
+borsh = { workspace = true, default-features = true, features = ["bytes", "rc"] }
+byteorder = { workspace = true, default-features = true }
+rlimit = { workspace = true }
+rocksdb = { workspace = true }
+serde = { workspace = true, default-features = true, features = ["rc"] }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+rand = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+
+
+[[bench]]
+name = "state_db_single_snapshot"
+path = "benches/state_db_bench.rs"
+harness = false

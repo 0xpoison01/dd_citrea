@@ -1,0 +1,65 @@
+[package]
+name = "sov-modules-api"
+description = "Defines the interface of the Sovereign SDK module system"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+version = { workspace = true }
+readme = "README.md"
+resolver = "2"
+
+[dependencies]
+jsonrpsee = { workspace = true, optional = true }
+anyhow = { workspace = true }
+digest = { workspace = true }
+sov-state = { path = "../sov-state" }
+sov-keys = { path = "../sov-keys" }
+sov-modules-core = { path = "../sov-modules-core" }
+sov-rollup-interface = { path = "../../rollup-interface" }
+sov-modules-macros = { path = "../sov-modules-macros", optional = true, default-features = false }
+serde = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+bech32 = { workspace = true }
+derive_more = { workspace = true, default-features = true }
+jmt = { workspace = true }
+serde_json = { workspace = true, optional = true }
+hex = { workspace = true }
+clap = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true, features = [] }
+
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
+tempfile = { workspace = true }
+sov-modules-api = { path = ".", features = ["native"] }
+sov-modules-core = { path = "../sov-modules-core", features = ["mocks"] }
+sov-db = { path = "../../full-node/db/sov-db" }
+sov-prover-storage-manager = { path = "../../full-node/sov-prover-storage-manager", features = [
+    "test-utils",
+] }
+
+
+[features]
+bench = []
+default = ["native", "macros"]
+native = [
+    "serde_json",
+    "rand",
+    "schemars",
+    "serde",
+    "clap",
+    "jsonrpsee",
+    "macros",
+    "sov-modules-core/native",
+    "sov-modules-macros/native",
+    "sov-state/native",
+]
+macros = ["sov-modules-macros"]
+serde = ["sov-modules-core/serde"]
+testing = []

@@ -1,0 +1,27 @@
+[package]
+name = "integration-tests"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+version = { workspace = true }
+readme = "README.md"
+publish = false
+resolver = "2"
+
+[dev-dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true, features = ["rc"] }
+tempfile = { workspace = true }
+serde = { workspace = true }
+jsonrpsee = { workspace = true }
+
+sov-modules-api = { path = "../../sov-modules-api", features = ["native"] }
+sov-state = { path = "../../sov-state", features = ["native"] }
+
+sov-schema-db = { path = "../../../full-node/db/sov-schema-db" }
+sov-rollup-interface = { path = "../../../rollup-interface", features = ["native"] }
+
+sov-prover-storage-manager = { path = "../../../full-node/sov-prover-storage-manager", features = ["test-utils"] }

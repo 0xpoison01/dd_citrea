@@ -1,0 +1,22 @@
+[public_keys]
+sequencer_public_key = "036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7"
+sequencer_da_pub_key = "0000000000000000000000000000000000000000000000000000000000000000"
+prover_da_pub_key = ""
+
+[da]
+sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
+db_path = "resources/dbs/da-db"
+
+[storage]
+# The path to the rollup's data directory. Paths that do not begin with `/` are interpreted as relative paths.
+path = "resources/dbs/sequencer-db"
+db_max_open_files = 5000
+
+[rpc]
+# the host and port to bind the rpc server for
+bind_host = "0.0.0.0"
+bind_port = 8545
+max_connections = 10000
+enable_subscriptions = true
+max_subscriptions_per_connection = 100
+stale_filter_ttl = 300

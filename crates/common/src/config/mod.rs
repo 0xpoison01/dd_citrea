@@ -1,0 +1,896 @@
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use citrea_primitives::PRE_TANGERINE_BRIDGE_INITIALIZE_PARAMS;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+pub use crate::config::rpc::RpcConfig;
+use crate::sp1::SP1HostConfig;
+use crate::utils::read_env;
+
+/// Configuration types for SP1 provers
+pub mod sp1;
+
+mod rpc;
+
+pub trait FromEnv: Sized {
+    fn from_env() -> anyhow::Result<Self>;
+}
+
+impl FromEnv for PruningConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(PruningConfig {
+            distance: read_env("PRUNING_DISTANCE")?.parse()?,
+        })
+    }
+}
+
+impl FromEnv for sov_mock_da::MockDaConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            sender_address: read_env("SENDER_ADDRESS")?.parse()?,
+            db_path: read_env("DB_PATH")?.into(),
+        })
+    }
+}
+
+#[inline]
+const fn default_sync_blocks_count() -> u64 {
+    10
+}
+
+/// Runner configuration.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RunnerConfig {
+    /// Sequencer client configuration.
+    pub sequencer_client_url: String,
+    /// Saves sequencer l2 blocks if set to true
+    pub include_tx_body: bool,
+    /// Number of blocks to request during sync
+    #[serde(default = "default_sync_blocks_count")]
+    pub sync_blocks_count: u64,
+    /// Configurations for pruning
+    pub pruning_config: Option<PruningConfig>,
+    /// The DA block number to start L1 sync from
+    pub scan_l1_start_height: u64,
+}
+
+impl FromEnv for RunnerConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            sequencer_client_url: read_env("SEQUENCER_CLIENT_URL")?,
+            include_tx_body: read_env("INCLUDE_TX_BODY")?.parse()?,
+            sync_blocks_count: read_env("SYNC_BLOCKS_COUNT")
+                .ok()
+                .and_then(|val| val.parse().ok())
+                .unwrap_or_else(default_sync_blocks_count),
+            pruning_config: PruningConfig::from_env().ok(),
+            scan_l1_start_height: read_env("SCAN_L1_START_HEIGHT")?.parse()?,
+        })
+    }
+}
+
+/// Simple storage configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// Path that can be utilized by concrete rollup implementation
+    pub path: PathBuf,
+    /// Optional path for storing database backups
+    /// If not specified, backup path will need to be provided on each backup creation
+    pub backup_path: Option<PathBuf>,
+    /// File descriptor limit for RocksDB
+    pub db_max_open_files: Option<i32>,
+}
+
+impl FromEnv for StorageConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            path: read_env("STORAGE_PATH")?.into(),
+            backup_path: read_env("STORAGE_BACKUP_PATH")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            db_max_open_files: read_env("DB_MAX_OPEN_FILES")
+                .ok()
+                .and_then(|val| val.parse().ok()),
+        })
+    }
+}
+
+/// Important public keys for the rollup
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RollupPublicKeys {
+    /// L2 block signing k256 public key of the Sequencer
+    #[serde(with = "hex::serde")]
+    pub sequencer_public_key: Vec<u8>,
+    /// DA Signing Public Key of the Sequencer
+    /// serialized as hex
+    #[serde(with = "hex::serde")]
+    pub sequencer_da_pub_key: Vec<u8>,
+    /// DA Signing Public Key of the Prover
+    /// serialized as hex
+    #[serde(with = "hex::serde")]
+    pub prover_da_pub_key: Vec<u8>,
+}
+
+impl FromEnv for RollupPublicKeys {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            sequencer_public_key: hex::decode(read_env("SEQUENCER_PUBLIC_KEY")?)?,
+            sequencer_da_pub_key: hex::decode(read_env("SEQUENCER_DA_PUB_KEY")?)?,
+            prover_da_pub_key: hex::decode(read_env("PROVER_DA_PUB_KEY")?)?,
+        })
+    }
+}
+
+/// Rollup Configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct FullNodeConfig<BitcoinServiceConfig> {
+    /// RPC configuration
+    pub rpc: RpcConfig,
+    /// Currently rollup config runner only supports storage path parameter
+    pub storage: StorageConfig,
+    /// Runner own configuration.
+    pub runner: Option<RunnerConfig>, // optional bc sequencer and lcp doesn't need it
+    /// Data Availability service configuration.
+    pub da: BitcoinServiceConfig,
+    /// Important pubkeys
+    pub public_keys: RollupPublicKeys,
+    /// Telemetry configuration
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+impl<DaC: FromEnv> FromEnv for FullNodeConfig<DaC> {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            rpc: RpcConfig::from_env()?,
+            storage: StorageConfig::from_env()?,
+            runner: RunnerConfig::from_env().ok(),
+            da: DaC::from_env()?,
+            public_keys: RollupPublicKeys::from_env()?,
+            telemetry: TelemetryConfig::from_env()?,
+        })
+    }
+}
+
+/// Prover configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct BatchProverConfig {
+    /// Prover run mode
+    pub proving_mode: ProverGuestRunConfig,
+    /// Average number of commitments to prove
+    pub proof_sampling_number: usize,
+    /// Maximum number of commitments per proof partition
+    pub max_commitments_per_proof: Option<usize>,
+    /// Configuration for SP1Host
+    #[serde(default)]
+    pub sp1_host: SP1HostConfig,
+}
+
+/// Prover configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct LightClientProverConfig {
+    /// Prover run mode
+    pub proving_mode: ProverGuestRunConfig,
+    /// Average number of commitments to prove
+    pub proof_sampling_number: usize,
+    /// The starting DA block to sync from
+    pub initial_da_height: u64,
+    /// Configuration for SP1Host
+    #[serde(default)]
+    pub sp1_host: SP1HostConfig,
+}
+
+impl Default for BatchProverConfig {
+    fn default() -> Self {
+        Self {
+            proving_mode: ProverGuestRunConfig::Execute,
+            proof_sampling_number: 0,
+            max_commitments_per_proof: None,
+            sp1_host: Default::default(),
+        }
+    }
+}
+
+impl Default for LightClientProverConfig {
+    fn default() -> Self {
+        Self {
+            proving_mode: ProverGuestRunConfig::Execute,
+            proof_sampling_number: 0,
+            initial_da_height: 1,
+            sp1_host: Default::default(),
+        }
+    }
+}
+
+impl FromEnv for BatchProverConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(BatchProverConfig {
+            proving_mode: serde_json::from_str(&format!("\"{}\"", read_env("PROVING_MODE")?))?,
+            proof_sampling_number: read_env("PROOF_SAMPLING_NUMBER")?.parse()?,
+            max_commitments_per_proof: read_env("MAX_COMMITMENTS_PER_PROOF")
+                .ok()
+                .and_then(|val| val.parse().ok()),
+            sp1_host: SP1HostConfig::from_env()?,
+        })
+    }
+}
+
+impl FromEnv for LightClientProverConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(LightClientProverConfig {
+            proving_mode: serde_json::from_str(&format!("\"{}\"", read_env("PROVING_MODE")?))?,
+            proof_sampling_number: read_env("PROOF_SAMPLING_NUMBER")?.parse()?,
+            initial_da_height: read_env("INITIAL_DA_HEIGHT")?.parse()?,
+            sp1_host: SP1HostConfig::from_env()?,
+        })
+    }
+}
+
+/// Reads toml file as a specific type.
+pub fn from_toml_path<P: AsRef<Path>, R: DeserializeOwned>(path: P) -> anyhow::Result<R> {
+    let mut contents = String::new();
+    {
+        let mut file = File::open(path)?;
+        file.read_to_string(&mut contents)?;
+    }
+    tracing::debug!("Config file size: {} bytes", contents.len());
+    tracing::trace!("Config file contents: {}", &contents);
+
+    let result: R = toml::from_str(&contents)?;
+
+    Ok(result)
+}
+
+#[inline]
+const fn default_l1_fee_rate_multiplier() -> f64 {
+    1.0
+}
+
+#[inline]
+const fn default_max_l1_fee_rate_sat_vb() -> u64 {
+    15 // sat/vbyte
+}
+
+#[inline]
+const fn default_l1_fee_rate_update_interval_ms() -> u64 {
+    30_000 // 30 seconds
+}
+
+#[inline]
+const fn default_dry_run_time_limit_ms() -> u64 {
+    500 // ms; time budget for the per-block transaction-selection loop
+}
+
+/// Rollup Configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SequencerConfig {
+    /// Private key of the sequencer
+    pub private_key: String,
+    /// Min. l2 blocks for sequencer to commit
+    pub max_l2_blocks_per_commitment: u64,
+    /// Whether or not the sequencer is running in test mode
+    pub test_mode: bool,
+    /// Limit for the number of deposit transactions to be included in the block
+    pub deposit_mempool_fetch_limit: usize,
+    /// Sequencer specific mempool config
+    pub mempool_conf: SequencerMempoolConfig,
+    /// DA layer update loop interval in ms
+    pub da_update_interval_ms: u64,
+    /// Block production interval in ms
+    pub block_production_interval_ms: u64,
+    /// Bridge system contract initialize function parameters
+    #[serde(with = "hex")]
+    pub bridge_initialize_params: Vec<u8>,
+    /// L1 fee rate multiplier
+    #[serde(default = "default_l1_fee_rate_multiplier")]
+    pub l1_fee_rate_multiplier: f64,
+    /// Maximum L1 fee rate in sat/vbyte
+    #[serde(default = "default_max_l1_fee_rate_sat_vb")]
+    pub max_l1_fee_rate_sat_vb: u64,
+    /// L1 fee rate update interval in ms
+    #[serde(default = "default_l1_fee_rate_update_interval_ms")]
+    pub l1_fee_rate_update_interval_ms: u64,
+    /// Time budget (ms) for the per-block transaction-selection ("dry run") loop. Bounds how long
+    /// the sequencer spends executing candidate transactions while building a block.
+    #[serde(default = "default_dry_run_time_limit_ms")]
+    pub dry_run_time_limit_ms: u64,
+}
+
+impl Default for SequencerConfig {
+    fn default() -> Self {
+        SequencerConfig {
+            private_key: "1212121212121212121212121212121212121212121212121212121212121212"
+                .to_string(),
+            max_l2_blocks_per_commitment: 4,
+            test_mode: true,
+            deposit_mempool_fetch_limit: 10,
+            block_production_interval_ms: 100,
+            da_update_interval_ms: 100,
+            bridge_initialize_params: PRE_TANGERINE_BRIDGE_INITIALIZE_PARAMS.to_vec(),
+            mempool_conf: Default::default(),
+            l1_fee_rate_multiplier: 1.0,
+            max_l1_fee_rate_sat_vb: 1, // doesn't matter since mock da returns 10 wei/byte
+            l1_fee_rate_update_interval_ms: default_l1_fee_rate_update_interval_ms(),
+            dry_run_time_limit_ms: default_dry_run_time_limit_ms(),
+        }
+    }
+}
+
+impl FromEnv for SequencerConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            private_key: read_env("PRIVATE_KEY")?,
+            max_l2_blocks_per_commitment: read_env("MAX_L2_BLOCKS_PER_COMMITMENT")?.parse()?,
+            test_mode: read_env("TEST_MODE")?.parse()?,
+            deposit_mempool_fetch_limit: read_env("DEPOSIT_MEMPOOL_FETCH_LIMIT")?.parse()?,
+            mempool_conf: SequencerMempoolConfig::from_env()?,
+            da_update_interval_ms: read_env("DA_UPDATE_INTERVAL_MS")?.parse()?,
+            block_production_interval_ms: read_env("BLOCK_PRODUCTION_INTERVAL_MS")?.parse()?,
+            bridge_initialize_params: hex::decode(read_env("BRIDGE_INITIALIZE_PARAMS")?)?,
+            l1_fee_rate_multiplier: read_env("L1_FEE_RATE_MULTIPLIER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_l1_fee_rate_multiplier),
+            max_l1_fee_rate_sat_vb: read_env("MAX_L1_FEE_RATE_SAT_VB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_max_l1_fee_rate_sat_vb),
+            l1_fee_rate_update_interval_ms: read_env("L1_FEE_RATE_UPDATE_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_l1_fee_rate_update_interval_ms),
+            dry_run_time_limit_ms: read_env("SEQUENCER_DRY_RUN_TIME_LIMIT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_dry_run_time_limit_ms),
+        })
+    }
+}
+
+#[inline]
+const fn default_additional_validation_tasks() -> u64 {
+    4
+}
+
+/// Mempool maintenance configuration wrapper since the original struct
+/// does not support serialize / deserialize
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct MempoolMaintenanceConfig {
+    /// Maximum accounts to reload from state at once
+    #[serde(default = "default_max_reload_accounts")]
+    pub max_reload_accounts: usize,
+    /// Maximum lifetime for non-executable transactions in seconds
+    #[serde(default = "default_max_tx_lifetime_secs")]
+    pub max_tx_lifetime_secs: u64,
+}
+
+const fn default_max_reload_accounts() -> usize {
+    100
+}
+
+const fn default_max_tx_lifetime_secs() -> u64 {
+    10800
+}
+
+impl Default for MempoolMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            max_reload_accounts: default_max_reload_accounts(),
+            max_tx_lifetime_secs: default_max_tx_lifetime_secs(),
+        }
+    }
+}
+
+impl FromEnv for MempoolMaintenanceConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            max_reload_accounts: std::env::var("SEQUENCER_MEMPOOL_MAX_RELOAD_ACCOUNTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_max_reload_accounts),
+            max_tx_lifetime_secs: std::env::var("SEQUENCER_MEMPOOL_MAX_TX_LIFETIME_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_max_tx_lifetime_secs),
+        })
+    }
+}
+
+impl From<MempoolMaintenanceConfig> for reth_transaction_pool::maintain::MaintainPoolConfig {
+    fn from(config: MempoolMaintenanceConfig) -> Self {
+        Self {
+            max_reload_accounts: config.max_reload_accounts,
+            max_tx_lifetime: std::time::Duration::from_secs(config.max_tx_lifetime_secs),
+            ..Default::default()
+        }
+    }
+}
+
+/// Mempool Config for the sequencer
+/// Read: https://github.com/ledgerwatch/erigon/wiki/Transaction-Pool-Design
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SequencerMempoolConfig {
+    /// Max number of transactions in the pending sub-pool
+    pub pending_tx_limit: u64,
+    /// Max megabytes of transactions in the pending sub-pool
+    pub pending_tx_size: u64,
+    /// Max number of transactions in the queued sub-pool
+    pub queue_tx_limit: u64,
+    /// Max megabytes of transactions in the queued sub-pool
+    pub queue_tx_size: u64,
+    /// Max number of transactions in the base-fee sub-pool
+    pub base_fee_tx_limit: u64,
+    /// Max megabytes of transactions in the base-fee sub-pool
+    pub base_fee_tx_size: u64,
+    /// Max number of executable transaction slots guaranteed per account
+    pub max_account_slots: u64,
+    /// Number of additional transaction validation tasks to run in parallel (on top of the one
+    /// always-present task)
+    #[serde(default = "default_additional_validation_tasks")]
+    pub additional_validation_tasks: u64,
+    /// Mempool maintenance configuration
+    #[serde(default)]
+    pub maintenance: MempoolMaintenanceConfig,
+}
+
+impl Default for SequencerMempoolConfig {
+    fn default() -> Self {
+        Self {
+            pending_tx_limit: 100000,
+            pending_tx_size: 200,
+            queue_tx_limit: 100000,
+            queue_tx_size: 200,
+            base_fee_tx_limit: 100000,
+            base_fee_tx_size: 200,
+            max_account_slots: 16,
+            additional_validation_tasks: default_additional_validation_tasks(),
+            maintenance: MempoolMaintenanceConfig::default(),
+        }
+    }
+}
+
+impl FromEnv for SequencerMempoolConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            pending_tx_limit: read_env("PENDING_TX_LIMIT")?.parse()?,
+            pending_tx_size: read_env("PENDING_TX_SIZE")?.parse()?,
+            queue_tx_limit: read_env("QUEUE_TX_LIMIT")?.parse()?,
+            queue_tx_size: read_env("QUEUE_TX_SIZE")?.parse()?,
+            base_fee_tx_limit: read_env("BASE_FEE_TX_LIMIT")?.parse()?,
+            base_fee_tx_size: read_env("BASE_FEE_TX_SIZE")?.parse()?,
+            max_account_slots: read_env("MAX_ACCOUNT_SLOTS")?.parse()?,
+            additional_validation_tasks: read_env("SEQUENCER_MEMPOOL_ADDITIONAL_VALIDATION_TASKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_additional_validation_tasks),
+            maintenance: MempoolMaintenanceConfig::from_env()?,
+        })
+    }
+}
+
+/// Telemetry configuration.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct TelemetryConfig {
+    /// Server host.
+    pub bind_host: Option<String>,
+    /// Server port.
+    pub bind_port: Option<u16>,
+}
+
+impl FromEnv for TelemetryConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        let bind_host = read_env("TELEMETRY_BIND_HOST").ok();
+        let bind_port = read_env("TELEMETRY_BIND_PORT").ok();
+        Ok(Self {
+            bind_host,
+            bind_port: bind_port.map(|p| p.parse()).transpose()?,
+        })
+    }
+}
+
+/// The possible configurations of the prover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProverGuestRunConfig {
+    /// Skip proving.
+    Skip,
+    /// Run the rollup verifier in a zkVM executor.
+    Execute,
+    /// Run the rollup verifier and create a SNARK of execution.
+    Prove,
+    /// Run the rollup verifier and create a SNARK or a fake proof of execution.
+    ProveWithFakeProofs,
+}
+
+impl<'de> Deserialize<'de> for ProverGuestRunConfig {
+    fn deserialize<D>(deserializer: D) -> Result<ProverGuestRunConfig, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <std::string::String as Deserialize>::deserialize(deserializer)?;
+        match s.as_str() {
+            "skip" => Ok(ProverGuestRunConfig::Skip),
+            "execute" => Ok(ProverGuestRunConfig::Execute),
+            "prove" => Ok(ProverGuestRunConfig::Prove),
+            "prove-with-fakes" => Ok(ProverGuestRunConfig::ProveWithFakeProofs),
+            _ => Err(serde::de::Error::custom("invalid prover guest run config")),
+        }
+    }
+}
+
+/// A configuration type to define the behaviour of the pruner.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PruningConfig {
+    /// Defines the number of blocks from the tip of the chain to remove.
+    pub distance: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+    use crate::config::rpc::*;
+
+    fn create_config_from(content: &str) -> NamedTempFile {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file.write_all(content.as_bytes()).unwrap();
+        config_file
+    }
+
+    #[test]
+    fn test_correct_rollup_config() {
+        let config =
+            r#"
+            [public_keys]
+            sequencer_public_key = "000000000000000000000000000000000000000000000000000000000000000000"
+            sequencer_da_pub_key = "7777777777777777777777777777777777777777777777777777777777777777"
+            prover_da_pub_key = ""
+
+            [rpc]
+            bind_host = "127.0.0.1"
+            bind_port = 12345
+            max_connections = 500
+            enable_subscriptions = true
+            max_subscriptions_per_connection = 200
+            trace_chain_block_limit = 100
+            proving_jobs_limit = 50
+            stale_filter_ttl = 300
+
+            [da]
+            sender_address = "0000000000000000000000000000000000000000000000000000000000000000"
+            db_path = "/tmp/da"
+
+            [storage]
+            path = "/tmp/rollup"
+            db_max_open_files = 123
+
+            [runner]
+            include_tx_body = true
+            sequencer_client_url = "http://0.0.0.0:12346"
+            scan_l1_start_height = 1
+
+            [telemetry]
+            bind_host = "0.0.0.0"
+            bind_port = 8001
+        "#.to_owned();
+
+        let config_file = create_config_from(&config);
+
+        let config: FullNodeConfig<sov_mock_da::MockDaConfig> =
+            from_toml_path(config_file.path()).unwrap();
+
+        let expected = FullNodeConfig {
+            runner: Some(RunnerConfig {
+                sequencer_client_url: "http://0.0.0.0:12346".to_owned(),
+                include_tx_body: true,
+                sync_blocks_count: 10,
+                pruning_config: None,
+                scan_l1_start_height: 1,
+            }),
+            da: sov_mock_da::MockDaConfig {
+                sender_address: [0; 32].into(),
+                db_path: "/tmp/da".into(),
+            },
+            storage: StorageConfig {
+                path: "/tmp/rollup".into(),
+                backup_path: None,
+                db_max_open_files: Some(123),
+            },
+            rpc: RpcConfig {
+                bind_host: "127.0.0.1".to_string(),
+                bind_port: 12345,
+                max_connections: 500,
+                max_request_body_size: 10 * 1024 * 1024,
+                max_response_body_size: 10 * 1024 * 1024,
+                batch_requests_limit: 50,
+                enable_subscriptions: true,
+                max_subscriptions_per_connection: 200,
+                trace_chain_block_limit: Some(100),
+                trace_memory_limit_mb: 512,
+                trace_cache_limit_mb: 512,
+                max_tracing_requests: 4,
+                gas_cap: 100_000_000,
+                proving_jobs_limit: 50,
+                timeout: 30,
+                enable_js_tracer: true,
+                api_key: None,
+                stale_filter_ttl: Some(300),
+                enable_filters: true,
+                max_sync_send_timeout_ms: 20_000,
+            },
+            public_keys: RollupPublicKeys {
+                sequencer_public_key: vec![0; 33],
+                sequencer_da_pub_key: vec![119; 32],
+                prover_da_pub_key: vec![],
+            },
+            telemetry: TelemetryConfig {
+                bind_host: Some("0.0.0.0".to_owned()),
+                bind_port: Some(8001),
+            },
+        };
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn test_correct_prover_config() {
+        let config = r#"
+            proving_mode = "skip"
+            proof_sampling_number = 500
+        "#;
+
+        let config_file = create_config_from(config);
+
+        let config: BatchProverConfig = from_toml_path(config_file.path()).unwrap();
+        let expected = BatchProverConfig {
+            proving_mode: ProverGuestRunConfig::Skip,
+            proof_sampling_number: 500,
+            max_commitments_per_proof: None,
+            sp1_host: Default::default(),
+        };
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn test_correct_sequencer_config() {
+        let config = r#"
+            private_key = "1212121212121212121212121212121212121212121212121212121212121212"
+            max_l2_blocks_per_commitment = 123
+            test_mode = false
+            deposit_mempool_fetch_limit = 10
+            da_update_interval_ms = 1000
+            block_production_interval_ms = 1000
+            bridge_initialize_params = "000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000008ac7230489e80000000000000000000000000000000000000000000000000000000000000000002d4a209fb3a961d8b1f4ec1caa220c6a50b815febc0b689ddf0b9ddfbf99cb74479e41ac0063066369747265611400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a08000000003b9aca006800000000000000000000000000000000000000000000"
+            l1_fee_rate_multiplier = 0.75
+
+            [mempool_conf]
+            pending_tx_limit = 100000
+            pending_tx_size = 200
+            queue_tx_limit = 100000
+            queue_tx_size = 200
+            base_fee_tx_limit = 100000
+            base_fee_tx_size = 200
+            max_account_slots = 16
+        "#;
+
+        let config_file = create_config_from(config);
+
+        let config: SequencerConfig = from_toml_path(config_file.path()).unwrap();
+
+        let expected = SequencerConfig {
+            private_key: "1212121212121212121212121212121212121212121212121212121212121212"
+                .to_string(),
+            max_l2_blocks_per_commitment: 123,
+            test_mode: false,
+            deposit_mempool_fetch_limit: 10,
+            mempool_conf: SequencerMempoolConfig {
+                pending_tx_limit: 100000,
+                pending_tx_size: 200,
+                queue_tx_limit: 100000,
+                queue_tx_size: 200,
+                base_fee_tx_limit: 100000,
+                base_fee_tx_size: 200,
+                max_account_slots: 16,
+                additional_validation_tasks: default_additional_validation_tasks(),
+                maintenance: MempoolMaintenanceConfig::default(),
+            },
+            da_update_interval_ms: 1000,
+            block_production_interval_ms: 1000,
+            bridge_initialize_params: PRE_TANGERINE_BRIDGE_INITIALIZE_PARAMS.to_vec(),
+            l1_fee_rate_multiplier: 0.75,
+            max_l1_fee_rate_sat_vb: 15,
+            l1_fee_rate_update_interval_ms: 30_000,
+            dry_run_time_limit_ms: default_dry_run_time_limit_ms(),
+        };
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn test_correct_prover_config_from_env() {
+        std::env::set_var("PROVING_MODE", "skip");
+        std::env::set_var("PROOF_SAMPLING_NUMBER", "500");
+        std::env::remove_var("TX_BACKUP_DIR");
+
+        let prover_config = BatchProverConfig::from_env().unwrap();
+
+        let expected = BatchProverConfig {
+            proving_mode: ProverGuestRunConfig::Skip,
+            proof_sampling_number: 500,
+            max_commitments_per_proof: None,
+            sp1_host: Default::default(),
+        };
+        assert_eq!(prover_config, expected);
+    }
+    #[test]
+    fn test_correct_sequencer_config_from_env() {
+        std::env::set_var(
+            "PRIVATE_KEY",
+            "1212121212121212121212121212121212121212121212121212121212121212",
+        );
+        std::env::set_var("MAX_L2_BLOCKS_PER_COMMITMENT", "123");
+        std::env::set_var("TEST_MODE", "false");
+        std::env::set_var("DEPOSIT_MEMPOOL_FETCH_LIMIT", "10");
+        std::env::set_var("DA_UPDATE_INTERVAL_MS", "1000");
+        std::env::set_var("BLOCK_PRODUCTION_INTERVAL_MS", "1000");
+        std::env::set_var("PENDING_TX_LIMIT", "100000");
+        std::env::set_var("PENDING_TX_SIZE", "200");
+        std::env::set_var("QUEUE_TX_LIMIT", "100000");
+        std::env::set_var("QUEUE_TX_SIZE", "200");
+        std::env::set_var("BASE_FEE_TX_LIMIT", "100000");
+        std::env::set_var("BASE_FEE_TX_SIZE", "200");
+        std::env::set_var("MAX_ACCOUNT_SLOTS", "16");
+        std::env::set_var("BRIDGE_INITIALIZE_PARAMS", "000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000008ac7230489e80000000000000000000000000000000000000000000000000000000000000000002d4a209fb3a961d8b1f4ec1caa220c6a50b815febc0b689ddf0b9ddfbf99cb74479e41ac0063066369747265611400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a08000000003b9aca006800000000000000000000000000000000000000000000");
+        std::env::set_var("MAX_L1_FEE_RATE_SAT_VB", "40");
+
+        let sequencer_config = SequencerConfig::from_env().unwrap();
+
+        let expected = SequencerConfig {
+            private_key: "1212121212121212121212121212121212121212121212121212121212121212"
+                .to_string(),
+            max_l2_blocks_per_commitment: 123,
+            test_mode: false,
+            deposit_mempool_fetch_limit: 10,
+            mempool_conf: SequencerMempoolConfig {
+                pending_tx_limit: 100000,
+                pending_tx_size: 200,
+                queue_tx_limit: 100000,
+                queue_tx_size: 200,
+                base_fee_tx_limit: 100000,
+                base_fee_tx_size: 200,
+                max_account_slots: 16,
+                additional_validation_tasks: default_additional_validation_tasks(),
+                maintenance: MempoolMaintenanceConfig::default(),
+            },
+            da_update_interval_ms: 1000,
+            block_production_interval_ms: 1000,
+            bridge_initialize_params: PRE_TANGERINE_BRIDGE_INITIALIZE_PARAMS.to_vec(),
+            l1_fee_rate_multiplier: 1.0,
+            max_l1_fee_rate_sat_vb: 40,
+            l1_fee_rate_update_interval_ms: 30_000,
+            dry_run_time_limit_ms: default_dry_run_time_limit_ms(),
+        };
+        assert_eq!(sequencer_config, expected);
+    }
+
+    #[test]
+    fn test_correct_full_node_config_from_env() {
+        std::env::set_var(
+            "SEQUENCER_PUBLIC_KEY",
+            "000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        std::env::set_var(
+            "SEQUENCER_DA_PUB_KEY",
+            "7777777777777777777777777777777777777777777777777777777777777777",
+        );
+        std::env::set_var("PROVER_DA_PUB_KEY", "");
+
+        std::env::set_var("RPC_BIND_HOST", "127.0.0.1");
+        std::env::set_var("RPC_BIND_PORT", "12345");
+        std::env::set_var("RPC_MAX_CONNECTIONS", "500");
+        std::env::set_var("RPC_ENABLE_SUBSCRIPTIONS", "true");
+        std::env::set_var("RPC_MAX_SUBSCRIPTIONS_PER_CONNECTION", "200");
+        std::env::set_var("RPC_ENABLE_JS_TRACER", "true");
+        std::env::set_var("RPC_PROVING_JOBS_LIMIT", "50");
+        std::env::set_var("RPC_TIMEOUT", "30");
+
+        std::env::set_var(
+            "SENDER_ADDRESS",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        std::env::set_var("DB_PATH", "/tmp/da");
+
+        std::env::set_var("STORAGE_PATH", "/tmp/rollup");
+        std::env::set_var("DB_MAX_OPEN_FILES", "123");
+
+        std::env::set_var("INCLUDE_TX_BODY", "true");
+        std::env::set_var("SEQUENCER_CLIENT_URL", "http://0.0.0.0:12346");
+        std::env::set_var("PRUNING_DISTANCE", "1000");
+        std::env::set_var("SCAN_L1_START_HEIGHT", "1");
+
+        std::env::set_var("TELEMETRY_BIND_HOST", "0.0.0.0");
+        std::env::set_var("TELEMETRY_BIND_PORT", "8082");
+        let full_node_config: FullNodeConfig<sov_mock_da::MockDaConfig> =
+            FullNodeConfig::from_env().unwrap();
+
+        let expected = FullNodeConfig {
+            rpc: RpcConfig {
+                bind_host: "127.0.0.1".to_string(),
+                bind_port: 12345,
+                max_connections: 500,
+                max_request_body_size: default_max_request_body_size(),
+                max_response_body_size: default_max_response_body_size(),
+                batch_requests_limit: default_batch_requests_limit(),
+                enable_subscriptions: true,
+                max_subscriptions_per_connection: 200,
+                trace_chain_block_limit: None,
+                trace_memory_limit_mb: 512,
+                trace_cache_limit_mb: 512,
+                max_tracing_requests: 4,
+                gas_cap: 100_000_000,
+                proving_jobs_limit: 50,
+                timeout: 30,
+                enable_js_tracer: true,
+                api_key: None,
+                stale_filter_ttl: None,
+                enable_filters: true,
+                max_sync_send_timeout_ms: 20_000,
+            },
+            storage: StorageConfig {
+                path: "/tmp/rollup".into(),
+                backup_path: None,
+                db_max_open_files: Some(123),
+            },
+            runner: Some(RunnerConfig {
+                sequencer_client_url: "http://0.0.0.0:12346".to_string(),
+                include_tx_body: true,
+                sync_blocks_count: default_sync_blocks_count(),
+                pruning_config: Some(PruningConfig { distance: 1000 }),
+                scan_l1_start_height: 1,
+            }),
+            da: sov_mock_da::MockDaConfig {
+                sender_address: [0; 32].into(),
+                db_path: "/tmp/da".into(),
+            },
+            public_keys: RollupPublicKeys {
+                sequencer_public_key: vec![0; 33],
+                sequencer_da_pub_key: vec![119; 32],
+                prover_da_pub_key: vec![],
+            },
+            telemetry: TelemetryConfig {
+                bind_host: Some("0.0.0.0".to_owned()),
+                bind_port: Some(8082),
+            },
+        };
+        assert_eq!(full_node_config, expected);
+    }
+
+    #[test]
+    fn test_optional_telemetry_config_from_env() {
+        // Clear env vars that might be set by other tests
+        std::env::remove_var("TELEMETRY_BIND_HOST");
+        std::env::remove_var("TELEMETRY_BIND_PORT");
+
+        let telemetry_config = TelemetryConfig::from_env().unwrap();
+
+        let expected = TelemetryConfig {
+            bind_host: None,
+            bind_port: None,
+        };
+        assert_eq!(telemetry_config, expected);
+
+        std::env::set_var("TELEMETRY_BIND_HOST", "0.0.0.0");
+        std::env::set_var("TELEMETRY_BIND_PORT", "5000");
+        let telemetry_config = TelemetryConfig::from_env().unwrap();
+
+        let expected = TelemetryConfig {
+            bind_host: Some("0.0.0.0".to_owned()),
+            bind_port: Some(5000),
+        };
+        assert_eq!(telemetry_config, expected);
+    }
+}

@@ -1,0 +1,54 @@
+[package]
+name = "sov-modules-macros"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Macros for use with the Sovereign SDK module system"
+
+version = { workspace = true }
+autotests = false
+readme = "README.md"
+resolver = "2"
+
+[lib]
+proc-macro = true
+
+[[test]]
+name = "tests"
+path = "tests/all_tests.rs"
+
+[dev-dependencies]
+sov-modules-api = { path = "../sov-modules-api", features = ["native"] }
+sov-modules-core = { path = "../sov-modules-core" }
+sov-state = { path = "../sov-state" }
+sha2 = { workspace = true }
+
+borsh = { workspace = true }
+jsonrpsee = { workspace = true, features = ["macros", "http-client", "server"] }
+serde = { workspace = true }
+trybuild = "1.0"
+
+[dependencies]
+jsonrpsee = { workspace = true, features = [
+    "http-client",
+    "server",
+], optional = true }
+proc-macro2 = "1.0"
+quote = "1.0"
+serde_json = { workspace = true }
+syn = { version = "1.0", features = ["full", "extra-traits"] }
+
+[features]
+default = ["native"]
+native = ["jsonrpsee"]
+
+[package.metadata.cargo-udeps.ignore]
+development = [
+    "borsh",
+    "sov-modules-api",
+    "sov-modules-core",
+    "sov-state",
+    "sha2",
+]

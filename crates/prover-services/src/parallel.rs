@@ -1,0 +1,274 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::anyhow;
+use rand::Rng;
+use sov_rollup_interface::da::DaTxRequest;
+use sov_rollup_interface::services::da::DaService;
+use sov_rollup_interface::zk::{Proof, ProofWithJob, ReceiptType, ZkvmHost};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+use crate::metrics::PARALLEL_PROVER_METRICS;
+use crate::{ProofData, ProofGenMode, ProofWithDuration};
+
+/// Prover service capable of invoking the zkVM proving sessions in parallel.
+pub struct ParallelProverService<Da, Vm>
+where
+    Da: DaService,
+    Vm: ZkvmHost + 'static,
+{
+    proof_semaphore: Arc<Semaphore>,
+    proof_mode: ProofGenMode,
+    da_service: Arc<Da>,
+    vm: Vm,
+}
+
+impl<Da, Vm> ParallelProverService<Da, Vm>
+where
+    Da: DaService,
+    Vm: ZkvmHost,
+{
+    /// Creates a new `ParallelProverService`. Panics if parallel proof limit is 0.
+    pub fn new(
+        da_service: Arc<Da>,
+        vm: Vm,
+        proof_mode: ProofGenMode,
+        parallel_proof_limit: usize,
+    ) -> anyhow::Result<Self> {
+        assert!(
+            parallel_proof_limit > 0,
+            "Prover thread pool size must be greater than 0"
+        );
+
+        match proof_mode {
+            ProofGenMode::Skip => {
+                info!("Prover is configured to skip proving");
+            }
+            ProofGenMode::Execute => {
+                info!("Prover is configured to execute proving");
+            }
+            ProofGenMode::ProveWithSampling => {
+                info!("Prover is configured to prove");
+            }
+            ProofGenMode::ProveWithSamplingWithFakeProofs(proof_sampling_number) => {
+                if proof_sampling_number == 0 {
+                    info!("Prover is configured to always prove");
+                } else {
+                    info!(
+                        "Prover is configured to prove with fake proofs with 1/{proof_sampling_number} sampling"
+                    );
+                }
+            }
+        };
+
+        Ok(Self {
+            proof_semaphore: Arc::new(Semaphore::new(parallel_proof_limit)),
+            proof_mode,
+            da_service,
+            vm,
+        })
+    }
+
+    /// Creates a new `ParallelProverService` with thread_pool_size retrieved from
+    /// environment variable `PARALLEL_PROOF_LIMIT`. If non-existent, will panic.
+    pub fn new_from_env(
+        da_service: Arc<Da>,
+        vm: Vm,
+        proof_mode: ProofGenMode,
+    ) -> anyhow::Result<Self> {
+        let parallel_proof_limit = std::env::var("PARALLEL_PROOF_LIMIT")
+            .expect("PARALLEL_PROOF_LIMIT must be set")
+            .parse::<usize>()
+            .expect("PARALLEL_PROOF_LIMIT must be valid unsigned number");
+
+        Self::new(da_service, vm, proof_mode, parallel_proof_limit)
+    }
+
+    /// Runs proving in a blocking manner. This just calls `start_proving` and waits for the result.
+    ///
+    /// * `data` - the proof data to be used for generating a proof
+    /// * `receipt_type` - the expected receipt type of the proof
+    pub async fn prove(
+        &self,
+        data: ProofData,
+        receipt_type: ReceiptType,
+    ) -> anyhow::Result<ProofWithDuration> {
+        let job_id = Uuid::new_v4();
+        let rx = self.start_proving(data, receipt_type, job_id).await?;
+        Ok(rx.await?)
+    }
+
+    /// Starts the proving task in the background and returns a channel which will resolve
+    /// once the proving is done. If there is not enough proving slots left, this function
+    /// will block until it can get a slot and start the proof.
+    ///
+    /// ## Arguments
+    ///
+    /// * `data` - the proof data to be used for generating a proof
+    /// * `receipt_type` - the expected receipt type of the proof
+    /// * `job_id` - the job id that is correlated to the proof
+    ///
+    /// ## Returns
+    ///
+    /// * a channel that will resolve once the proving job is done
+    #[instrument(name = "ParallelProverService", skip_all)]
+    pub async fn start_proving(
+        &self,
+        data: ProofData,
+        receipt_type: ReceiptType,
+        job_id: Uuid,
+    ) -> anyhow::Result<oneshot::Receiver<ProofWithDuration>> {
+        let permit = self.reserve_proof_slot().await?;
+
+        let ProofData {
+            input,
+            assumptions,
+            elf,
+            program,
+        } = data;
+
+        let mut vm = self.vm.clone();
+
+        vm.add_hint(input);
+        for assumption in assumptions {
+            vm.add_assumption(assumption);
+        }
+
+        // start proof immediately in the background
+        let proof_start_time = std::time::Instant::now();
+        let proof_rx = make_proof(vm, job_id, elf, program, self.proof_mode, receipt_type)
+            .await
+            .inspect_err(|_| PARALLEL_PROVER_METRICS.ongoing_proving_jobs.decrement(1))
+            .map_err(|e| anyhow!("Failed to start proving {e}"))?;
+        debug!("Started proving job");
+
+        let (tx, rx) = oneshot::channel();
+        // the reason we pipe the proof_rx to a new channel is because we need to
+        // keep track of the number of ongoing proofs and notify the caller when the proof is done
+        tokio::spawn(async move {
+            let _permit = permit; // Hold permit until task completion
+            let proof = proof_rx.await;
+
+            PARALLEL_PROVER_METRICS.ongoing_proving_jobs.decrement(1);
+
+            match proof {
+                Ok(proof) => {
+                    let ProofWithJob { proof, info, .. } = proof;
+
+                    let duration = Instant::now()
+                        .saturating_duration_since(proof_start_time)
+                        .as_secs_f64();
+                    let proof_with_duration = ProofWithDuration {
+                        proof,
+                        duration,
+                        info,
+                    };
+                    tx.send(proof_with_duration)
+                        .expect("Proof channel should not close");
+                }
+                Err(e) => {
+                    // even if we can't send the proof to the caller, we still send notification for
+                    // rest of the awaiters to continue, hence, no return
+                    error!("Vm proving channel closed abruptly: {}", e);
+                }
+            }
+
+            debug!("Finished proving job");
+        });
+
+        Ok(rx)
+    }
+
+    /// Reserves a proof slot. If the limit is reached, it will wait for a proof to finish.
+    async fn reserve_proof_slot(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let available_permits = self.proof_semaphore.available_permits();
+
+        let mut proof_was_queued = false;
+        if available_permits == 0 {
+            PARALLEL_PROVER_METRICS
+                .proof_count_waiting_in_queue
+                .increment(1);
+            proof_was_queued = true;
+            warn!("Reached parallel proof limit, waiting for one of the proving tasks to finish");
+        }
+
+        let permit = self.proof_semaphore.clone().acquire_owned().await?;
+
+        PARALLEL_PROVER_METRICS.ongoing_proving_jobs.increment(1);
+
+        if proof_was_queued {
+            PARALLEL_PROVER_METRICS
+                .proof_count_waiting_in_queue
+                .decrement(1);
+        }
+
+        Ok(permit)
+    }
+
+    /// Submits the zk proof to the DA service, returning transaction id.
+    #[instrument(name = "ParallelProverService", skip_all, fields(job_id = _job_id.to_string()))]
+    pub async fn submit_proof(
+        &self,
+        proof: Proof,
+        _job_id: Uuid,
+    ) -> anyhow::Result<<Da as DaService>::TransactionId> {
+        let tx_request = DaTxRequest::ZKProof(proof);
+        info!("Submitting proof to DA service");
+        self.da_service
+            .send_transaction(tx_request)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    // Only used in tests
+    pub async fn submit_proofs(
+        &self,
+        proofs: Vec<Proof>,
+    ) -> anyhow::Result<Vec<(<Da as DaService>::TransactionId, Proof)>> {
+        let mut tx_and_proof = Vec::with_capacity(proofs.len());
+        let job_id = Uuid::nil();
+        for proof in proofs {
+            let tx_id = self.submit_proof(proof.clone(), job_id).await?;
+            tx_and_proof.push((tx_id, proof));
+        }
+        Ok(tx_and_proof)
+    }
+}
+
+/// Runs the zkVM proving session. Decides on whether to produce a real proof or a fake proof based on the proof mode.
+async fn make_proof<Vm>(
+    mut vm: Vm,
+    job_id: Uuid,
+    elf: Vec<u8>,
+    program: [u32; 8],
+    proof_mode: ProofGenMode,
+    receipt_type: ReceiptType,
+) -> Result<oneshot::Receiver<ProofWithJob>, anyhow::Error>
+where
+    Vm: ZkvmHost,
+{
+    let with_prove = match proof_mode {
+        ProofGenMode::Skip => {
+            unimplemented!("ProofGenMode::Skip is not yet implemented")
+        }
+        ProofGenMode::Execute => false,
+        ProofGenMode::ProveWithSampling => {
+            // `make_proof` is called with a probability in this case.
+            // When it's called, we have to produce a real proof.
+            true
+        }
+        ProofGenMode::ProveWithSamplingWithFakeProofs(proof_sampling) => {
+            // `make_proof` is called unconditionally in this case.
+            // When it's called, we have to calculate the probability for a proof
+            //  and produce a real proof if we are lucky. If unlucky - produce a fake proof.
+            proof_sampling == 0 || rand::thread_rng().gen_range(0..proof_sampling) == 0
+        }
+    };
+
+    let rx = vm
+        .run(job_id, elf, program, receipt_type, with_prove)
+        .await?;
+    Ok(rx)
+}

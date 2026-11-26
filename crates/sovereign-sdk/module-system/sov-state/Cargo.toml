@@ -1,0 +1,36 @@
+[package]
+name = "sov-state"
+description = "Defines traits and types for state storage in the Sovereign SDK module system"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+version = { workspace = true }
+readme = "README.md"
+resolver = "2"
+
+[dependencies]
+alloy-primitives = { workspace = true, default-features = false }
+alloy-rlp = { workspace = true }
+anyhow = { workspace = true }
+borsh = { workspace = true, features = ["rc", "bytes"] }
+bytes = { workspace = true }
+bcs = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+sov-rollup-interface = { path = "../../rollup-interface" }
+sov-modules-core = { path = "../sov-modules-core" }
+sov-keys = { path = "../sov-keys" }
+sov-db = { path = "../../full-node/db/sov-db", optional = true }
+sov-schema-db = { path = "../../full-node/db/sov-schema-db", optional = true }
+jmt = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+native = ["sov-db", "sov-schema-db"]

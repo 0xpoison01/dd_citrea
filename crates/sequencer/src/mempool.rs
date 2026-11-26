@@ -1,0 +1,192 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use alloy_eips::Typed2718;
+use alloy_primitives::{Address, TxHash};
+use citrea_common::SequencerMempoolConfig;
+use citrea_evm::SYSTEM_SIGNER;
+use citrea_primitives::min_base_fee_per_gas;
+use reth_tasks::TaskExecutor;
+use reth_transaction_pool::blobstore::NoopBlobStore;
+use reth_transaction_pool::error::{PoolError, PoolErrorKind};
+use reth_transaction_pool::{
+    AllPoolTransactions, BestTransactions, BestTransactionsAttributes, CoinbaseTipOrdering,
+    EthPooledTransaction, Pool, PoolConfig, PoolResult, PoolTransaction, SubPoolLimit,
+    TransactionPool, TransactionValidationTaskExecutor, ValidPoolTransaction,
+};
+use sov_modules_api::SpecId;
+
+use crate::db_provider::DbProvider;
+use crate::tx_validator::CitreaTransactionValidator;
+
+/// Saving the pool on shutdown and restoring it on startup.
+mod persistence;
+
+/// The concrete implementation type for the Citrea mempool, using Reth's Pool with custom configuration
+type CitreaMempoolImpl = Pool<
+    TransactionValidationTaskExecutor<CitreaTransactionValidator>,
+    CoinbaseTipOrdering<EthPooledTransaction>,
+    NoopBlobStore,
+>;
+
+/// Type alias for the transaction type used in the Citrea mempool
+type Transaction = <CitreaMempoolImpl as TransactionPool>::Transaction;
+
+/// An abstraction on top of Reth's mempool with custom Citrea functionality.
+pub struct CitreaMempool {
+    /// Reth pool.
+    pool: CitreaMempoolImpl,
+    /// File the pool is saved to on graceful shutdown and restored from on startup.
+    snapshot_path: PathBuf,
+}
+
+impl CitreaMempool {
+    /// Creates a new instance of the Citrea mempool.
+    pub(crate) fn new(
+        client: DbProvider,
+        mempool_conf: SequencerMempoolConfig,
+        task_executor: TaskExecutor,
+        snapshot_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let blob_store = NoopBlobStore::default();
+
+        let evm_config = client.cfg();
+
+        // Default 10x'ed from standard limits
+        let pool_config = PoolConfig {
+            pending_limit: SubPoolLimit {
+                max_txs: mempool_conf.pending_tx_limit as usize,
+                max_size: (mempool_conf.pending_tx_size * 1024 * 1024) as usize,
+            },
+            basefee_limit: SubPoolLimit {
+                max_txs: mempool_conf.base_fee_tx_limit as usize,
+                max_size: (mempool_conf.base_fee_tx_size * 1024 * 1024) as usize,
+            },
+            queued_limit: SubPoolLimit {
+                max_txs: mempool_conf.queue_tx_limit as usize,
+                max_size: (mempool_conf.queue_tx_size * 1024 * 1024) as usize,
+            },
+            blob_limit: SubPoolLimit {
+                max_txs: 0,
+                max_size: 0,
+            },
+            max_account_slots: mempool_conf.max_account_slots as usize,
+            minimal_protocol_basefee: min_base_fee_per_gas(SpecId::latest()),
+            ..Default::default()
+        };
+
+        // Keep a provider handle for the custom validator before `client` is moved into the builder.
+        let provider = client.clone();
+
+        let validator = TransactionValidationTaskExecutor::eth_builder(client)
+            .no_eip4844()
+            .set_shanghai(true)
+            .set_cancun(true)
+            .set_prague(true)
+            // TODO: if we ever increase block gas limits, we need to pull this from
+            // somewhere else
+            .set_block_gas_limit(evm_config.block_gas_limit)
+            // Admission runs a per-tx EVM simulation to reserve the L1 fee, so run validation
+            // across several tasks in parallel instead of the single default task.
+            .with_additional_tasks(mempool_conf.additional_validation_tasks as usize)
+            .build_with_tasks::<EthPooledTransaction, _, _>(task_executor, blob_store)
+            // Wrap the stock validator so it also reserves the Citrea L1 fee. `.map` preserves
+            // the already-spawned validation-task channel.
+            .map(move |inner| CitreaTransactionValidator::new(inner, provider.clone()));
+
+        // `Pool::eth_pool` is hardcoded to `EthTransactionValidator`, so build the pool directly
+        // with the same ordering it would have used.
+        Ok(Self {
+            pool: Pool::new(
+                validator,
+                CoinbaseTipOrdering::default(),
+                blob_store,
+                pool_config,
+            ),
+            snapshot_path,
+        })
+    }
+
+    /// Add a transaction to the mempool
+    pub(crate) async fn add_external_transaction(
+        &self,
+        transaction: EthPooledTransaction,
+    ) -> PoolResult<TxHash> {
+        if transaction.transaction().signer() == SYSTEM_SIGNER {
+            return Err(PoolError::other(
+                *transaction.hash(),
+                "system transactions from rpc are not allowed",
+            ));
+        }
+
+        if transaction.transaction().is_eip4844() {
+            return Err(PoolError::new(
+                *transaction.hash(),
+                PoolErrorKind::InvalidTransaction(
+                    reth_transaction_pool::error::InvalidPoolTransactionError::Consensus(
+                        reth_primitives::InvalidTransactionError::Eip4844Disabled,
+                    ),
+                ),
+            ));
+        }
+
+        self.pool.add_external_transaction(transaction).await
+    }
+
+    /// Find and return a transaction by hash
+    pub(crate) fn get(&self, hash: &TxHash) -> Option<Arc<ValidPoolTransaction<Transaction>>> {
+        self.pool.get(hash)
+    }
+
+    /// Returns all transactions in the pool
+    pub(crate) fn all_transactions(&self) -> AllPoolTransactions<Transaction> {
+        self.pool.all_transactions()
+    }
+
+    /// Remove all transactions corresponding to the given hashes.
+    pub(crate) fn remove_transactions(
+        &self,
+        tx_hashes: Vec<TxHash>,
+    ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
+        self.pool.remove_transactions(tx_hashes)
+    }
+
+    /// Removes all transactions corresponding to the given hashes
+    /// Also removes all dependent transactions.
+    pub(crate) fn remove_transactions_and_descendants(
+        &self,
+        tx_hashes: Vec<TxHash>,
+    ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
+        self.pool.remove_transactions_and_descendants(tx_hashes)
+    }
+
+    /// Removes all transactions from the given sender
+    pub(crate) fn remove_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Transaction>>> {
+        self.pool.remove_transactions_by_sender(sender)
+    }
+
+    /// Gets the best transactions from the mempool with specific attributes
+    ///
+    /// # Arguments
+    /// * `best_transactions_attributes` - Attributes to consider when selecting transactions
+    ///
+    /// # Returns
+    /// A boxed iterator of valid pool transactions
+    pub(crate) fn best_transactions_with_attributes(
+        &self,
+        best_transactions_attributes: BestTransactionsAttributes,
+    ) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Transaction>>>> {
+        self.pool
+            .best_transactions_with_attributes(best_transactions_attributes)
+    }
+
+    /// Returns a reference to the underlying pool implementation
+    ///
+    /// This is needed for the maintenance task to access the pool directly
+    pub(crate) fn inner_pool(&self) -> &CitreaMempoolImpl {
+        &self.pool
+    }
+}

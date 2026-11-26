@@ -1,0 +1,318 @@
+#![doc = include_str!("../README.md")]
+
+mod containers;
+pub mod default_context;
+pub mod hooks;
+
+pub use sov_rollup_interface::fork;
+pub use sov_rollup_interface::spec::SpecId;
+pub use sov_rollup_interface::stf::{L2BlockHookError, L2BlockModuleCallError};
+
+#[cfg(feature = "macros")]
+mod reexport_macros;
+#[cfg(feature = "macros")]
+pub use reexport_macros::*;
+
+#[macro_export]
+macro_rules! native_debug {
+    (?$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::debug!(?$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    (%$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::debug!(%$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    ($($k:ident).+ = $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::debug!($($k).+ = $($field)*);
+    );
+    ($($k:ident).+, $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::debug!($($k).+, $($field)*);
+    );
+    ($($t:expr),* $(,)?) => {
+        #[cfg(feature = "native")]
+        ::tracing::debug!($($t),*);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $t;)*
+    };
+}
+
+#[macro_export]
+macro_rules! native_error {
+    (?$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::error!(?$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    (%$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::error!(%$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    ($($k:ident).+ = $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::error!($($k).+ = $($field)*);
+    );
+    ($($k:ident).+, $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::error!($($k).+, $($field)*);
+    );
+    ($($t:expr),* $(,)?) => {
+        #[cfg(feature = "native")]
+        ::tracing::error!($($t),*);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $t;)*
+    };
+}
+
+#[macro_export]
+macro_rules! native_info {
+    (?$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::info!(?$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    (%$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::info!(%$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    ($($k:ident).+ = $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::info!($($k).+ = $($field)*);
+    );
+    ($($k:ident).+, $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::info!($($k).+, $($field)*);
+    );
+    ($($t:expr),* $(,)?) => {
+        #[cfg(feature = "native")]
+        ::tracing::info!($($t),*);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $t;)*
+    };
+}
+
+#[macro_export]
+macro_rules! native_trace {
+    (?$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::trace!(?$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    (%$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::trace!(%$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    ($($k:ident).+ = $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::trace!($($k).+ = $($field)*);
+    );
+    ($($k:ident).+, $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::trace!($($k).+, $($field)*);
+    );
+    ($($t:expr),* $(,)?) => {
+        #[cfg(feature = "native")]
+        ::tracing::trace!($($t),*);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $t;)*
+    };
+}
+
+#[macro_export]
+macro_rules! native_warn {
+    (?$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::warn!(?$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    (%$($k:ident).+) => (
+        #[cfg(feature = "native")]
+        ::tracing::warn!(%$($k).+);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $k;)*
+    );
+    ($($k:ident).+ = $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::warn!($($k).+ = $($field)*);
+    );
+    ($($k:ident).+, $($field:tt)*) => (
+        #[cfg(feature = "native")]
+        ::tracing::warn!($($k).+, $($field)*);
+    );
+    ($($t:expr),* $(,)?) => {
+        #[cfg(feature = "native")]
+        ::tracing::warn!($($t),*);
+        #[cfg(not(feature = "native"))]
+        $(let _ = $t;)*
+    };
+}
+
+#[cfg(test)]
+mod tests;
+// pub mod transaction;
+#[cfg(feature = "native")]
+pub mod utils;
+
+pub use containers::*;
+#[cfg(feature = "macros")]
+extern crate sov_modules_macros;
+
+use std::collections::{HashMap, HashSet};
+
+#[cfg(feature = "native")]
+pub use clap;
+#[cfg(feature = "native")]
+pub use sov_keys::PrivateKey;
+pub use sov_modules_core::{
+    archival_state, runtime, AccessoryWorkingSet, Address, AddressBech32, CallResponse, Context,
+    DispatchCall, EncodeCall, Genesis, Module, ModuleCallJsonSchema, ModuleInfo, ModulePrefix,
+    Spec, StateCheckpoint, StateReaderAndWriter, WorkingSet,
+};
+pub use sov_rollup_interface::block::L2Block;
+pub use sov_rollup_interface::da::{BlobReaderTrait, DaSpec};
+pub use sov_rollup_interface::services::da::SlotData;
+pub use sov_rollup_interface::stf::StateDiff;
+pub use sov_rollup_interface::zk::batch_proof::output::v3::BatchProofCircuitOutputV3;
+pub use sov_rollup_interface::zk::Zkvm;
+pub use sov_rollup_interface::{digest, BasicAddress, RollupAddress};
+
+pub mod prelude {
+    pub use super::{StateMapAccessor, StateValueAccessor, StateVecAccessor};
+}
+
+pub mod da {
+    pub use sov_rollup_interface::da::{BlockHeaderTrait, NanoSeconds, Time};
+}
+
+struct ModuleVisitor<'a, C: Context> {
+    visited: HashSet<&'a <C as Spec>::Address>,
+    visited_on_this_path: Vec<&'a <C as Spec>::Address>,
+    sorted_modules: std::vec::Vec<&'a dyn ModuleInfo<Context = C>>,
+}
+
+impl<'a, C: Context> ModuleVisitor<'a, C> {
+    pub fn new() -> Self {
+        Self {
+            visited: HashSet::new(),
+            sorted_modules: Vec::new(),
+            visited_on_this_path: Vec::new(),
+        }
+    }
+
+    /// Visits all the modules and their dependencies, and populates a Vec of modules sorted by their dependencies
+    fn visit_modules(
+        &mut self,
+        modules: Vec<&'a dyn ModuleInfo<Context = C>>,
+    ) -> Result<(), anyhow::Error> {
+        let mut module_map = HashMap::new();
+
+        for module in &modules {
+            module_map.insert(module.address(), *module);
+        }
+
+        for module in modules {
+            self.visited_on_this_path.clear();
+            self.visit_module(module, &module_map)?;
+        }
+
+        Ok(())
+    }
+
+    /// Visits a module and its dependencies, and populates a Vec of modules sorted by their dependencies
+    fn visit_module(
+        &mut self,
+        module: &'a dyn ModuleInfo<Context = C>,
+        module_map: &HashMap<&<C as Spec>::Address, &'a dyn ModuleInfo<Context = C>>,
+    ) -> Result<(), anyhow::Error> {
+        let address = module.address();
+
+        // if the module have been visited on this path, then we have a cycle dependency
+        if let Some((index, _)) = self
+            .visited_on_this_path
+            .iter()
+            .enumerate()
+            .find(|(_, &x)| x == address)
+        {
+            let cycle = &self.visited_on_this_path[index..];
+
+            anyhow::bail!(
+                "Cyclic dependency of length {} detected: {:?}",
+                cycle.len(),
+                cycle
+            );
+        } else {
+            self.visited_on_this_path.push(address)
+        }
+
+        // if the module hasn't been visited yet, visit it and its dependencies
+        if self.visited.insert(address) {
+            for dependency_address in module.dependencies() {
+                let dependency_module = *module_map.get(dependency_address).ok_or_else(|| {
+                    anyhow::Error::msg(format!("Module not found: {dependency_address:?}"))
+                })?;
+                self.visit_module(dependency_module, module_map)?;
+            }
+
+            self.sorted_modules.push(module);
+        }
+
+        // remove the module from the visited_on_this_path list
+        self.visited_on_this_path.pop();
+
+        Ok(())
+    }
+}
+
+/// Sorts ModuleInfo objects by their dependencies
+fn sort_modules_by_dependencies<C: Context>(
+    modules: Vec<&dyn ModuleInfo<Context = C>>,
+) -> Result<Vec<&dyn ModuleInfo<Context = C>>, anyhow::Error> {
+    let mut module_visitor = ModuleVisitor::<C>::new();
+    module_visitor.visit_modules(modules)?;
+    Ok(module_visitor.sorted_modules)
+}
+
+/// Accepts Vec<> of tuples (&ModuleInfo, &TValue), and returns Vec<&TValue> sorted by mapped module dependencies
+pub fn sort_values_by_modules_dependencies<C: Context, TValue>(
+    module_value_tuples: Vec<(&dyn ModuleInfo<Context = C>, TValue)>,
+) -> Result<Vec<TValue>, anyhow::Error>
+where
+    TValue: Clone,
+{
+    let sorted_modules = sort_modules_by_dependencies(
+        module_value_tuples
+            .iter()
+            .map(|(module, _)| *module)
+            .collect(),
+    )?;
+
+    let mut value_map = HashMap::new();
+
+    for module in module_value_tuples {
+        let prev_entry = value_map.insert(module.0.address(), module.1);
+        anyhow::ensure!(prev_entry.is_none(), "Duplicate module address! Only one instance of each module is allowed in a given runtime. Module with address {} is duplicated", module.0.address());
+    }
+
+    let mut sorted_values = Vec::new();
+    for module in sorted_modules {
+        sorted_values.push(value_map.get(module.address()).unwrap().clone());
+    }
+
+    Ok(sorted_values)
+}

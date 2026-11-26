@@ -1,0 +1,31 @@
+# exclude everything
+*
+
+# include source files
+!/bin
+!/crates
+!/guests
+!/resources
+!Cargo.lock
+!Cargo.toml
+!deny.toml
+!constants.json
+!constants.test.json
+!Makefile
+!packages_to_publish.yml
+!rust-toolchain.toml
+!rustfmt.toml
+!/da-db
+
+# include devops files
+!devops/**
+
+# include for vergen constants
+!/.git
+
+
+
+# include licenses
+!LICENSE-*
+!LICENSE
+

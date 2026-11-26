@@ -1,0 +1,34 @@
+[package]
+name = "sov-schema-db"
+license = "Apache-2.0" # This license is inherited from Aptos
+description = "A low level interface transforming RocksDB into a type-oriented data store"
+
+# Workspace inherited keys
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+
+readme = "README.md"
+
+[dependencies]
+# External dependencies
+anyhow = { workspace = true, default-features = true }
+byteorder = { workspace = true, default-features = true, optional = true }
+metrics = { workspace = true }
+metrics-derive = { workspace = true }
+rocksdb = { workspace = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true, default-features = true }
+
+[dev-dependencies]
+byteorder = { workspace = true, default-features = true }
+sov-schema-db = { path = ".", features = ["test-utils"] }
+tempfile = { workspace = true }
+
+[features]
+default = []
+test-utils = ["dep:tempfile", "dep:byteorder"]

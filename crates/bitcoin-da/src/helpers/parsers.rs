@@ -1,0 +1,1085 @@
+//! Parsers for Bitcoin transactions related to Citrea rollup.
+
+use core::num::NonZero;
+
+use bitcoin::blockdata::script::Instruction;
+use bitcoin::opcodes::all::OP_CHECKSIGVERIFY;
+use bitcoin::script::Instruction::{Op, PushBytes};
+use bitcoin::script::{Error as ScriptError, PushBytes as StructPushBytes};
+use bitcoin::{Opcode, Script, Transaction, Witness};
+use sha2::Digest;
+use thiserror::Error;
+
+/// Number of witness elements in the first input of a Citrea reveal transaction:
+/// signature, tapscript and control block.
+pub const REVEAL_WITNESS_LEN: usize = 3;
+
+/// ParsedTransaction is an enum that represents the different kinds of transactions
+/// that can be parsed from a Bitcoin transaction script.
+#[derive(Debug, Clone)]
+pub enum ParsedTransaction {
+    /// Kind 0
+    Complete(ParsedComplete),
+    /// Kind 1
+    Aggregate(ParsedAggregate),
+    /// Kind 2
+    Chunk(ParsedChunk),
+    /// Kind 3
+    BatchProofMethodId(ParsedBatchProofMethodId),
+    /// Kind 4
+    SequencerCommitment(ParsedSequencerCommitment),
+    // /// Kind ?
+    // ForcedTransaction(ForcedTransaction),
+}
+
+/// ParsedComplete is a transaction that contains the full body of a proof.
+#[derive(Debug, Clone)]
+pub struct ParsedComplete {
+    pub(crate) body: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) public_key: Vec<u8>,
+}
+
+/// ParsedAggregate is a transaction that contains txids of chunks of data.
+#[derive(Debug, Clone)]
+pub struct ParsedAggregate {
+    pub(crate) body: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) public_key: Vec<u8>,
+}
+
+/// That's the only kind of transaction that does not have
+/// a signature (and a nonce) because the signature and the nonce live
+/// in the parent Aggregate transaction.
+#[derive(Debug, Clone)]
+pub struct ParsedChunk {
+    pub(crate) body: Vec<u8>,
+}
+
+/// ParsedSequencerCommitment is a transaction that contains the sequencer commitment.
+#[derive(Debug, Clone)]
+pub struct ParsedSequencerCommitment {
+    pub(crate) body: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) public_key: Vec<u8>,
+}
+
+/// ParsedBatchProofMethodId is a transaction that contains the batch proof method ID
+/// and the security council signatures and pubkeys.
+#[derive(Debug, Clone)]
+pub struct ParsedBatchProofMethodId {
+    /// Contains borsh(BatchProofMethodId)
+    /// So it has public keys and signatures of security council and the body
+    /// which is BatchProofMethodIdBody{activation_l2_height, method_id}
+    pub(crate) body: Vec<u8>,
+}
+
+impl ParsedBatchProofMethodId {
+    /// Hash of the body
+    pub fn hash(&self) -> [u8; 32] {
+        let hash = sha2::Sha256::new_with_prefix(&self.body);
+        hash.finalize().into()
+    }
+}
+
+/// To verify the signature of the inscription and get the hash of the body
+pub trait VerifyParsed {
+    /// Returns the public key used to verify the signature.
+    fn public_key(&self) -> &[u8];
+    /// Returns the signature of the inscription.
+    fn signature(&self) -> &[u8];
+    /// Returns the body of the inscription.
+    fn body(&self) -> &[u8];
+
+    /// Verifies the signature of the inscription and returns the hash of the body
+    /// Returns None if the signature is unparsable or doesn't belong to the body.
+    fn get_sig_verified_hash(&self) -> Option<[u8; 32]> {
+        if let Ok(key) = k256::ecdsa::VerifyingKey::from_sec1_bytes(self.public_key()) {
+            use k256::ecdsa::signature::DigestVerifier;
+            let hash = sha2::Sha256::new_with_prefix(self.body());
+            let signature = k256::ecdsa::Signature::from_slice(self.signature());
+            if signature.is_ok() && key.verify_digest(hash.clone(), &signature.unwrap()).is_ok() {
+                return Some(hash.finalize().into());
+            }
+        }
+
+        None
+    }
+}
+
+impl VerifyParsed for ParsedComplete {
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl VerifyParsed for ParsedAggregate {
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl VerifyParsed for ParsedSequencerCommitment {
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// Error type for the parser.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum ParserError {
+    /// Invalid header length.
+    #[error("Invalid header length")]
+    InvalidHeaderLength,
+    /// Invalid header type.
+    #[error("Invalid header type {0}")]
+    InvalidHeaderType(NonZero<u16>),
+    /// No witness in tapscript.
+    #[error("No witness in tapscript")]
+    NonTapscriptWitness,
+    /// The first input's witness does not have `REVEAL_WITNESS_LEN` elements.
+    #[error("Unexpected reveal witness length")]
+    UnexpectedWitnessLength,
+    /// A body push follows a push shorter than `MAX_SCRIPT_ELEMENT_SIZE`, or is empty.
+    #[error("Non-maximal body push")]
+    NonMaximalBodyPush,
+    /// Unexpected end of script.
+    #[error("Unexpected end of script")]
+    UnexpectedEndOfScript,
+    /// Invalid opcode in the script.
+    #[error("Invalid opcode in the script")]
+    UnexpectedOpcode,
+    /// The reveal was not signed by the expected DA key.
+    #[cfg(feature = "native")]
+    #[error("Invalid DA reveal signature")]
+    InvalidDaRevealSignature,
+    /// Body was not parsed correctly.
+    #[error("Body was not parsed correctly")]
+    InvalidBody,
+    /// Some other script error.
+    #[error("Script error: {0}")]
+    ScriptError(String),
+}
+
+impl From<ScriptError> for ParserError {
+    fn from(value: ScriptError) -> ParserError {
+        ParserError::ScriptError(value.to_string())
+    }
+}
+
+/// Parses a relevant transaction from the script.
+pub fn parse_relevant_transaction(tx: &Transaction) -> Result<ParsedTransaction, ParserError> {
+    let input = tx
+        .input
+        .first()
+        .ok_or(ParserError::UnexpectedWitnessLength)?;
+    parse_relevant_witness(&input.witness)
+}
+
+/// Parses a relevant transaction from the witness of its first input.
+pub fn parse_relevant_witness(witness: &Witness) -> Result<ParsedTransaction, ParserError> {
+    let script = get_script(witness)?;
+    let instructions = script.instructions().peekable();
+    // Map all Instructions errors into ParserError::ScriptError
+    let mut instructions = instructions.map(|r| r.map_err(ParserError::from));
+
+    parse_transaction(&mut instructions)
+}
+
+/// DA-key authentication of reveal transactions. Native-only: the circuit never authenticates a
+/// reveal against the DA key, so none of this is compiled into the guest.
+#[cfg(feature = "native")]
+mod reveal_auth {
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::Message;
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::taproot::{LeafVersion, Signature as TaprootSignature};
+    use bitcoin::{TapLeafHash, Transaction, TxOut, XOnlyPublicKey};
+    use secp256k1::SECP256K1;
+
+    use super::{get_script, parse_transaction, ParsedTransaction, ParserError};
+
+    /// Parses a relevant transaction only if it was signed by `expected_public_key`.
+    ///
+    /// Verifying the reveal's BIP341 signature proves the DA key authorized it. Finding the
+    /// public key in a witness would not: public keys can be copied into any transaction.
+    pub fn parse_relevant_transaction_signed_by(
+        tx: &Transaction,
+        spent_output: &TxOut,
+        expected_public_key: &XOnlyPublicKey,
+    ) -> Result<ParsedTransaction, ParserError> {
+        if tx.input.len() != 1 {
+            return Err(ParserError::InvalidDaRevealSignature);
+        }
+
+        let input = &tx.input[0];
+
+        // Our builders always produce [signature, tapscript, control block] with SIGHASH_DEFAULT,
+        // which is what binds the signature to every input and output.
+        if input.witness.len() != super::REVEAL_WITNESS_LEN {
+            return Err(ParserError::InvalidDaRevealSignature);
+        }
+        let script = get_script(&input.witness)?;
+        let signature = input
+            .witness
+            .nth(0)
+            .and_then(|bytes| TaprootSignature::from_slice(bytes).ok())
+            .filter(|signature| signature.sighash_type == TapSighashType::Default)
+            .ok_or(ParserError::InvalidDaRevealSignature)?;
+
+        let tapleaf_hash = TapLeafHash::from_script(script, LeafVersion::TapScript);
+        let signature_hash = SighashCache::new(tx)
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(&[spent_output]),
+                tapleaf_hash,
+                signature.sighash_type,
+            )
+            .map_err(|_| ParserError::InvalidDaRevealSignature)?;
+        let message = Message::from_digest_slice(signature_hash.as_byte_array())
+            .map_err(|_| ParserError::InvalidDaRevealSignature)?;
+        SECP256K1
+            .verify_schnorr(&signature.signature, &message, expected_public_key)
+            .map_err(|_| ParserError::InvalidDaRevealSignature)?;
+
+        let mut instructions = script.instructions().map(|r| r.map_err(ParserError::from));
+        parse_transaction(&mut instructions)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::key::UntweakedKeypair;
+        use bitcoin::opcodes::all::{OP_CHECKSIGVERIFY, OP_ENDIF, OP_IF, OP_NIP};
+        use bitcoin::opcodes::OP_FALSE;
+        use bitcoin::script::{self, PushBytesBuf};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use bitcoin::taproot::TaprootBuilder;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness};
+
+        use super::*;
+        use crate::helpers::TransactionKind;
+
+        fn chunk_reveal_script(public_key: &XOnlyPublicKey) -> ScriptBuf {
+            script::Builder::new()
+                .push_x_only_key(public_key)
+                .push_opcode(OP_CHECKSIGVERIFY)
+                .push_slice(PushBytesBuf::from(TransactionKind::Chunks.to_bytes()))
+                .push_opcode(OP_FALSE)
+                .push_opcode(OP_IF)
+                .push_slice([1u8])
+                .push_opcode(OP_ENDIF)
+                .push_slice(16i64.to_le_bytes())
+                .push_opcode(OP_NIP)
+                .into_script()
+        }
+
+        fn taproot_prevout_and_control_block(
+            reveal_script: &ScriptBuf,
+            internal_key: XOnlyPublicKey,
+        ) -> (TxOut, Vec<u8>) {
+            let secp = Secp256k1::new();
+            let spend_info = TaprootBuilder::new()
+                .add_leaf(0, reveal_script.clone())
+                .unwrap()
+                .finalize(&secp, internal_key)
+                .unwrap();
+            let control_block = spend_info
+                .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
+                .unwrap();
+            let spent_output = TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, internal_key, spend_info.merkle_root()),
+            };
+
+            (spent_output, control_block.serialize())
+        }
+
+        fn signed_chunk_reveal(private_key: &SecretKey) -> (Transaction, TxOut, XOnlyPublicKey) {
+            let secp = Secp256k1::new();
+            let key_pair = UntweakedKeypair::from_secret_key(&secp, private_key);
+            let public_key = XOnlyPublicKey::from_keypair(&key_pair).0;
+            let reveal_script = chunk_reveal_script(&public_key);
+            let (spent_output, control_block) =
+                taproot_prevout_and_control_block(&reveal_script, public_key);
+            let mut tx = Transaction {
+                version: Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::ONE_SAT,
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let tapleaf_hash = TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript);
+            let signature_hash = SighashCache::new(&tx)
+                .taproot_script_spend_signature_hash(
+                    0,
+                    &Prevouts::All(&[&spent_output]),
+                    tapleaf_hash,
+                    TapSighashType::Default,
+                )
+                .unwrap();
+            let message = Message::from_digest_slice(signature_hash.as_byte_array()).unwrap();
+            let signature = secp.sign_schnorr_no_aux_rand(&message, &key_pair);
+
+            let mut witness = Witness::new();
+            witness.push(signature.as_ref());
+            witness.push(reveal_script);
+            witness.push(control_block);
+            tx.input[0].witness = witness;
+
+            (tx, spent_output, public_key)
+        }
+
+        #[test]
+        fn relevant_transaction_must_be_signed_by_expected_da_key() {
+            let private_key = SecretKey::from_slice(&[1; 32]).unwrap();
+            let (tx, spent_output, expected_public_key) = signed_chunk_reveal(&private_key);
+
+            assert!(
+                parse_relevant_transaction_signed_by(&tx, &spent_output, &expected_public_key)
+                    .is_ok()
+            );
+
+            let secp = Secp256k1::new();
+            let other_private_key = SecretKey::from_slice(&[2; 32]).unwrap();
+            let other_key_pair = UntweakedKeypair::from_secret_key(&secp, &other_private_key);
+            let other_public_key = XOnlyPublicKey::from_keypair(&other_key_pair).0;
+            assert_eq!(
+                parse_relevant_transaction_signed_by(&tx, &spent_output, &other_public_key)
+                    .unwrap_err(),
+                ParserError::InvalidDaRevealSignature
+            );
+
+            let script = tx.input[0].witness.nth(1).unwrap().to_vec();
+            let control_block = tx.input[0].witness.nth(2).unwrap().to_vec();
+            let mut invalid_signature_tx = tx.clone();
+            let mut witness = Witness::new();
+            witness.push([0u8; 64]);
+            witness.push(script);
+            witness.push(control_block);
+            invalid_signature_tx.input[0].witness = witness;
+            assert_eq!(
+                parse_relevant_transaction_signed_by(
+                    &invalid_signature_tx,
+                    &spent_output,
+                    &expected_public_key,
+                )
+                .unwrap_err(),
+                ParserError::InvalidDaRevealSignature
+            );
+
+            let mut tampered_tx = tx.clone();
+            tampered_tx.output[0].value += Amount::ONE_SAT;
+            assert_eq!(
+                parse_relevant_transaction_signed_by(
+                    &tampered_tx,
+                    &spent_output,
+                    &expected_public_key,
+                )
+                .unwrap_err(),
+                ParserError::InvalidDaRevealSignature
+            );
+
+            // The signature also covers the spent output, tying the reveal to the parent the
+            // caller fetched.
+            let other_spent_output = TxOut {
+                value: spent_output.value + Amount::ONE_SAT,
+                script_pubkey: spent_output.script_pubkey.clone(),
+            };
+            assert_eq!(
+                parse_relevant_transaction_signed_by(
+                    &tx,
+                    &other_spent_output,
+                    &expected_public_key,
+                )
+                .unwrap_err(),
+                ParserError::InvalidDaRevealSignature
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+pub use reveal_auth::parse_relevant_transaction_signed_by;
+
+// Returns the tapscript of a reveal input witness
+fn get_script(witness: &Witness) -> Result<&Script, ParserError> {
+    if witness.len() != REVEAL_WITNESS_LEN {
+        return Err(ParserError::UnexpectedWitnessLength);
+    }
+    witness
+        .taproot_leaf_script()
+        .filter(|leaf| leaf.version == bitcoin::taproot::LeafVersion::TapScript)
+        .map(|leaf| leaf.script)
+        .ok_or(ParserError::NonTapscriptWitness)
+}
+
+fn parse_transaction(
+    instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+) -> Result<ParsedTransaction, ParserError> {
+    use super::TransactionKind;
+
+    // PushBytes(XOnlyPublicKey)
+    let _public_key = read_push_bytes(instructions)?;
+    if OP_CHECKSIGVERIFY != read_opcode(instructions)? {
+        return Err(ParserError::UnexpectedOpcode);
+    }
+
+    // Parse header
+    let kind_slice = read_push_bytes(instructions)?;
+    let Some(kind) = TransactionKind::from_bytes(kind_slice.as_bytes()) else {
+        return Err(ParserError::InvalidHeaderLength);
+    };
+
+    // Parse transaction body according to type
+    match kind {
+        TransactionKind::Complete => {
+            body_parsers::parse_type_0_body(instructions).map(ParsedTransaction::Complete)
+        }
+        TransactionKind::Aggregate => {
+            body_parsers::parse_type_1_body(instructions).map(ParsedTransaction::Aggregate)
+        }
+        TransactionKind::Chunks => {
+            body_parsers::parse_type_2_body(instructions).map(ParsedTransaction::Chunk)
+        }
+        TransactionKind::BatchProofMethodId => {
+            body_parsers::parse_type_3_body(instructions).map(ParsedTransaction::BatchProofMethodId)
+        }
+        TransactionKind::SequencerCommitment => body_parsers::parse_type_4_body(instructions)
+            .map(ParsedTransaction::SequencerCommitment),
+        TransactionKind::Unknown(n) => Err(ParserError::InvalidHeaderType(n)),
+    }
+}
+
+/// Read next instruction or return Err(EOF).
+fn read_instr<'a>(
+    instructions: &mut dyn Iterator<Item = Result<Instruction<'a>, ParserError>>,
+) -> Result<Instruction<'a>, ParserError> {
+    let instr = instructions
+        .next()
+        .unwrap_or(Err(ParserError::UnexpectedEndOfScript))?;
+    Ok(instr)
+}
+
+/// Read next instruction expecting it to be PushBytes.
+fn read_push_bytes<'a>(
+    instructions: &mut dyn Iterator<Item = Result<Instruction<'a>, ParserError>>,
+) -> Result<&'a StructPushBytes, ParserError> {
+    let instr = read_instr(instructions)?;
+    match instr {
+        PushBytes(push_bytes) => Ok(push_bytes),
+        _ => Err(ParserError::UnexpectedOpcode),
+    }
+}
+
+/// Read next instruction expecting it to be Opcode (non-push opcode).
+fn read_opcode(
+    instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+) -> Result<Opcode, ParserError> {
+    let instr = read_instr(instructions)?;
+    let Op(op) = instr else {
+        return Err(ParserError::UnexpectedOpcode);
+    };
+    Ok(op)
+}
+
+/// The implementation of parsers for a specific type.
+mod body_parsers {
+    use bitcoin::blockdata::constants::MAX_SCRIPT_ELEMENT_SIZE;
+    use bitcoin::opcodes::all::{OP_ENDIF, OP_IF, OP_NIP};
+    use bitcoin::script::Instruction::{Op, PushBytes};
+    use bitcoin::script::{Instruction, PushBytes as StructPushBytes};
+
+    use super::{
+        read_instr, read_opcode, read_push_bytes, ParsedAggregate, ParsedChunk, ParsedComplete,
+        ParsedSequencerCommitment, ParserError,
+    };
+    use crate::helpers::parsers::ParsedBatchProofMethodId;
+
+    /// Appends a body push, which must follow a push of exactly `MAX_SCRIPT_ELEMENT_SIZE` bytes.
+    ///
+    /// Builders split bodies into maximal pushes, so only the last one can be shorter. Allowing
+    /// short pushes anywhere would let a reveal spend guest cycles per tiny push.
+    fn push_body_chunk<'a>(
+        chunks: &mut Vec<&'a StructPushBytes>,
+        chunk: &'a StructPushBytes,
+    ) -> Result<(), ParserError> {
+        if chunk.is_empty()
+            || chunks
+                .last()
+                .is_some_and(|prev| prev.len() != MAX_SCRIPT_ELEMENT_SIZE)
+        {
+            return Err(ParserError::NonMaximalBodyPush);
+        }
+        chunks.push(chunk);
+        Ok(())
+    }
+
+    /// Parse transaction body of Type0 Complete proof
+    pub(super) fn parse_type_0_body(
+        instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+    ) -> Result<ParsedComplete, ParserError> {
+        let op_false = read_push_bytes(instructions)?;
+        if !op_false.is_empty() {
+            // OP_FALSE = OP_PUSHBYTES_0
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        if OP_IF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let signature = read_push_bytes(instructions)?;
+        let public_key = read_push_bytes(instructions)?;
+
+        let mut chunks = vec![];
+
+        loop {
+            let instr = read_instr(instructions)?;
+            match instr {
+                PushBytes(chunk) => push_body_chunk(&mut chunks, chunk)?,
+                Op(OP_ENDIF) => break,
+                Op(_) => return Err(ParserError::UnexpectedOpcode),
+            }
+        }
+
+        // Nonce
+        let _nonce = read_push_bytes(instructions)?;
+        if OP_NIP != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+        // END of transaction
+        if instructions.next().is_some() {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let body_size: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut body = Vec::with_capacity(body_size);
+        for chunk in chunks {
+            body.extend_from_slice(chunk.as_bytes());
+        }
+
+        let signature = signature.as_bytes().to_vec();
+        let public_key = public_key.as_bytes().to_vec();
+
+        Ok(ParsedComplete {
+            body,
+            signature,
+            public_key,
+        })
+    }
+
+    /// Parse transaction body of Type1 Aggregate data
+    pub(super) fn parse_type_1_body(
+        instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+    ) -> Result<ParsedAggregate, ParserError> {
+        let op_false = read_push_bytes(instructions)?;
+        if !op_false.is_empty() {
+            // OP_FALSE = OP_PUSHBYTES_0
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        if OP_IF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let signature = read_push_bytes(instructions)?;
+        let public_key = read_push_bytes(instructions)?;
+
+        let mut chunks = vec![];
+
+        loop {
+            let instr = read_instr(instructions)?;
+            match instr {
+                PushBytes(chunk) => push_body_chunk(&mut chunks, chunk)?,
+                Op(OP_ENDIF) => break,
+                Op(_) => return Err(ParserError::UnexpectedOpcode),
+            }
+        }
+
+        // Nonce
+        let _nonce = read_push_bytes(instructions)?;
+        if OP_NIP != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+        // END of transaction
+        if instructions.next().is_some() {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let body_size: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut body = Vec::with_capacity(body_size);
+        for chunk in chunks {
+            body.extend_from_slice(chunk.as_bytes());
+        }
+
+        let signature = signature.as_bytes().to_vec();
+        let public_key = public_key.as_bytes().to_vec();
+
+        Ok(ParsedAggregate {
+            body,
+            signature,
+            public_key,
+        })
+    }
+
+    /// Parse transaction body of Type2 Chunk data
+    pub(super) fn parse_type_2_body(
+        instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+    ) -> Result<ParsedChunk, ParserError> {
+        let op_false = read_push_bytes(instructions)?;
+        if !op_false.is_empty() {
+            // OP_FALSE = OP_PUSHBYTES_0
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        if OP_IF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let mut chunks = vec![];
+
+        loop {
+            let instr = read_instr(instructions)?;
+            match instr {
+                PushBytes(chunk) => push_body_chunk(&mut chunks, chunk)?,
+                Op(OP_ENDIF) => break,
+                Op(_) => return Err(ParserError::UnexpectedOpcode),
+            }
+        }
+
+        // Nonce
+        let _nonce = read_push_bytes(instructions)?;
+        if OP_NIP != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+        // END of transaction
+        if instructions.next().is_some() {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let body_size: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut body = Vec::with_capacity(body_size);
+        for chunk in chunks {
+            body.extend_from_slice(chunk.as_bytes());
+        }
+
+        Ok(ParsedChunk { body })
+    }
+
+    /// Parse transaction body of Type3 Batch Proof MethodId upgrade tx
+    pub(super) fn parse_type_3_body(
+        instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+    ) -> Result<ParsedBatchProofMethodId, ParserError> {
+        let op_false = read_push_bytes(instructions)?;
+        if !op_false.is_empty() {
+            // OP_FALSE = OP_PUSHBYTES_0
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        if OP_IF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let body = read_push_bytes(instructions)?.as_bytes().to_vec();
+
+        if OP_ENDIF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        // Nonce
+        let _nonce = read_push_bytes(instructions)?;
+        if OP_NIP != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+        // END of transaction
+        if instructions.next().is_some() {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        Ok(ParsedBatchProofMethodId { body })
+    }
+
+    /// Parse transaction body of Type4 Sequencer Commitment
+    pub(super) fn parse_type_4_body(
+        instructions: &mut dyn Iterator<Item = Result<Instruction<'_>, ParserError>>,
+    ) -> Result<ParsedSequencerCommitment, ParserError> {
+        let op_false = read_push_bytes(instructions)?;
+        if !op_false.is_empty() {
+            // OP_FALSE = OP_PUSHBYTES_0
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        if OP_IF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let signature = read_push_bytes(instructions)?;
+        let public_key = read_push_bytes(instructions)?;
+        let body = read_push_bytes(instructions)?;
+
+        if OP_ENDIF != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        // Nonce
+        let _nonce = read_push_bytes(instructions)?;
+        if OP_NIP != read_opcode(instructions)? {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+        // END of transaction
+        if instructions.next().is_some() {
+            return Err(ParserError::UnexpectedOpcode);
+        }
+
+        let signature = signature.as_bytes().to_vec();
+        let public_key = public_key.as_bytes().to_vec();
+        let body = body.as_bytes().to_vec();
+
+        Ok(ParsedSequencerCommitment {
+            body,
+            signature,
+            public_key,
+        })
+    }
+}
+
+#[cfg(feature = "native")]
+/// Parses Bitcoin transaction from a hex-encoded transaction string.
+pub fn parse_hex_transaction(
+    tx_hex: &str,
+) -> Result<Transaction, bitcoin::consensus::encode::Error> {
+    use bitcoin::consensus::Decodable;
+
+    if let Ok(reader) = hex::decode(tx_hex) {
+        Transaction::consensus_decode(&mut &reader[..])
+    } else {
+        Err(bitcoin::consensus::encode::Error::ParseFailed(
+            "Could not decode hex",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::key::XOnlyPublicKey;
+    use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_ENDIF, OP_IF, OP_NIP};
+    use bitcoin::opcodes::{OP_FALSE, OP_TRUE};
+    use bitcoin::script::{self, PushBytesBuf};
+    use bitcoin::{Transaction, Witness};
+
+    use super::{
+        parse_relevant_transaction, parse_relevant_witness, parse_transaction, ParsedTransaction,
+        ParserError,
+    };
+    use crate::helpers::TransactionKind;
+
+    #[test]
+    fn correct() {
+        let kind = TransactionKind::Complete;
+
+        let reveal_script_builder = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([2u8; 64]) // signature
+            .push_slice([3u8; 64]) // public key
+            .push_slice(PushBytesBuf::try_from(vec![4u8; 520]).unwrap()) // chunk
+            .push_slice([4u8; 64]) // chunk
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes()) // random
+            .push_opcode(OP_NIP);
+
+        let reveal_script = reveal_script_builder.into_script();
+        let mut instructions = reveal_script
+            .instructions()
+            .map(|r| r.map_err(ParserError::from));
+
+        let result = parse_transaction(&mut instructions);
+
+        let result = result.inspect_err(|e| {
+            dbg!(e);
+        });
+        assert!(result.is_ok());
+
+        let ParsedTransaction::Complete(result) = result.unwrap() else {
+            panic!("Unexpected tx kind");
+        };
+
+        assert_eq!(result.body, vec![4u8; 584]);
+        assert_eq!(result.signature, vec![2u8; 64]);
+        assert_eq!(result.public_key, vec![3u8; 64]);
+    }
+
+    #[test]
+    fn only_checksig() {
+        let kind = TransactionKind::Complete;
+
+        let reveal_script_builder = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()));
+
+        let reveal_script = reveal_script_builder.into_script();
+
+        let mut instructions = reveal_script
+            .instructions()
+            .map(|r| r.map_err(ParserError::from));
+
+        let result = parse_transaction(&mut instructions);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ParserError::UnexpectedEndOfScript);
+    }
+
+    #[test]
+    fn non_parseable_tx() {
+        let hex_tx = "020000000001013a66019bfcc719ba12586a83ebbb0b3debdc945f563cd64fd44c8044e3d3a1790100000000fdffffff028fa2aa060000000017a9147ba15d4e0d8334de3a68cf3687594e2d1ee5b00d879179e0090000000016001493c93ad222e57d65438545e048822ede2d418a3d0247304402202432e6c422b93705fbc57b350ea43e4ef9441c0907988eff051eaac807fc8cf2022046c92b540b5f04f8da11febb5d2a478aed1b8bc088e769da8b78fffcae8c9a9a012103e2991b47d9c788f55379f9ef519b642d79d7dfe0e7555ec5575ee934b2dca1223f5d0c00";
+
+        let tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(hex_tx).unwrap()).unwrap();
+
+        let result = parse_relevant_transaction(&tx);
+
+        assert!(result.is_err(), "Failed to error on non-parseable tx.");
+        // A P2WPKH witness has two elements, so it is rejected before script parsing.
+        assert_eq!(result.unwrap_err(), ParserError::UnexpectedWitnessLength);
+    }
+
+    #[test]
+    fn reveal_witness_must_have_exactly_three_elements() {
+        let reveal_script = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(TransactionKind::Chunks.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([4u8; 64])
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes())
+            .push_opcode(OP_NIP)
+            .into_script();
+        let control_block = [0xc0; 33];
+
+        let mut witness = Witness::new();
+        witness.push([0u8; 64]);
+        witness.push(reveal_script.as_bytes());
+        witness.push(control_block);
+        assert!(matches!(
+            parse_relevant_witness(&witness),
+            Ok(ParsedTransaction::Chunk(_))
+        ));
+
+        let mut extra_stack_item = Witness::new();
+        extra_stack_item.push([]);
+        extra_stack_item.push([0u8; 64]);
+        extra_stack_item.push(reveal_script.as_bytes());
+        extra_stack_item.push(control_block);
+        assert_eq!(
+            parse_relevant_witness(&extra_stack_item).unwrap_err(),
+            ParserError::UnexpectedWitnessLength
+        );
+
+        let mut with_annex = witness.clone();
+        with_annex.push([0x50, 0x00]);
+        assert_eq!(
+            parse_relevant_witness(&with_annex).unwrap_err(),
+            ParserError::UnexpectedWitnessLength
+        );
+    }
+
+    fn body_script(kind: TransactionKind, pushes: &[usize]) -> bitcoin::ScriptBuf {
+        let mut builder = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF);
+        if !matches!(kind, TransactionKind::Chunks) {
+            builder = builder.push_slice([2u8; 64]).push_slice([3u8; 33]);
+        }
+        for &len in pushes {
+            builder = builder.push_slice(PushBytesBuf::try_from(vec![7u8; len]).unwrap());
+        }
+        builder
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes())
+            .push_opcode(OP_NIP)
+            .into_script()
+    }
+
+    fn parse_script(script: &bitcoin::Script) -> Result<ParsedTransaction, ParserError> {
+        let mut instructions = script.instructions().map(|r| r.map_err(ParserError::from));
+        parse_transaction(&mut instructions)
+    }
+
+    #[test]
+    fn body_pushes_must_be_maximal_except_the_last() {
+        for kind in [
+            TransactionKind::Complete,
+            TransactionKind::Aggregate,
+            TransactionKind::Chunks,
+        ] {
+            for pushes in [&[17][..], &[520], &[520, 520, 17], &[520, 520]] {
+                assert!(
+                    parse_script(&body_script(kind.clone(), pushes)).is_ok(),
+                    "{kind:?} {pushes:?}"
+                );
+            }
+            for pushes in [&[1, 1][..], &[17, 520], &[520, 519, 1], &[520, 0]] {
+                assert_eq!(
+                    parse_script(&body_script(kind.clone(), pushes)).unwrap_err(),
+                    ParserError::NonMaximalBodyPush,
+                    "{kind:?} {pushes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_push_flood_is_rejected() {
+        let script = body_script(TransactionKind::Chunks, &[1; 10_000]);
+        assert_eq!(
+            parse_script(&script).unwrap_err(),
+            ParserError::NonMaximalBodyPush
+        );
+    }
+
+    #[test]
+    fn complex_envelope() {
+        let kind = TransactionKind::Complete;
+
+        let reveal_script = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([2u8; 64]) // signature
+            .push_slice([3u8; 64]) // public key
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 64]).unwrap())
+            .push_opcode(OP_TRUE)
+            .push_opcode(OP_IF)
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes()) // random
+            .push_opcode(OP_NIP)
+            .into_script();
+
+        let mut instructions = reveal_script
+            .instructions()
+            .map(|r| r.map_err(ParserError::from));
+
+        let result = parse_transaction(&mut instructions);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ParserError::UnexpectedOpcode);
+    }
+
+    #[test]
+    fn two_envelopes() {
+        let kind = TransactionKind::Complete;
+
+        let reveal_script = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([2u8; 64]) // signature
+            .push_slice([3u8; 64]) // public key
+            .push_slice(PushBytesBuf::try_from(vec![0u8; 64]).unwrap())
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes()) // random
+            .push_opcode(OP_NIP)
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([2u8; 64]) // signature
+            .push_slice([3u8; 64]) // public key
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 64]).unwrap())
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes()) // random
+            .push_opcode(OP_NIP)
+            .into_script();
+
+        let mut instructions = reveal_script
+            .instructions()
+            .map(|r| r.map_err(ParserError::from));
+
+        let result = parse_transaction(&mut instructions);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ParserError::UnexpectedOpcode);
+    }
+
+    #[test]
+    fn big_push() {
+        let kind = TransactionKind::Complete;
+
+        let reveal_script = script::Builder::new()
+            .push_x_only_key(&XOnlyPublicKey::from_slice(&[1; 32]).unwrap())
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_slice(PushBytesBuf::from(kind.to_bytes()))
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice([2u8; 64]) // signature
+            .push_slice([3u8; 64]) // public key
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 520]).unwrap())
+            .push_opcode(OP_ENDIF)
+            .push_slice(42i64.to_le_bytes()) // random
+            .push_opcode(OP_NIP)
+            .into_script();
+
+        let mut instructions = reveal_script
+            .instructions()
+            .map(|r| r.map_err(ParserError::from));
+
+        let result = parse_transaction(&mut instructions);
+
+        assert!(result.is_ok());
+
+        let ParsedTransaction::Complete(result) = result.unwrap() else {
+            panic!("Unexpected tx kind");
+        };
+
+        assert_eq!(result.body, vec![1u8; 520 * 6]);
+        assert_eq!(result.signature, vec![2u8; 64]);
+        assert_eq!(result.public_key, vec![3u8; 64]);
+    }
+}

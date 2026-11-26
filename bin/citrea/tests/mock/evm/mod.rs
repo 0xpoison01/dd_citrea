@@ -1,0 +1,1752 @@
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::time::Duration;
+
+use alloy::consensus::constants::KECCAK_EMPTY;
+use alloy::hex::FromHex;
+use alloy::network::eip2718::Encodable2718;
+use alloy::network::TransactionResponse;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
+// use citrea::initialize_logging;
+use alloy_primitives::{Address, Bytes, B256, U256, U64};
+use alloy_rpc_types::{
+    Authorization, BlockId, BlockNumberOrTag, EIP1186AccountProofResponse, Filter,
+    TransactionRequest, ValueOrArray,
+};
+use citrea_common::sp1::SP1HostConfig;
+use citrea_common::{BatchProverConfig, FromEnv, SequencerConfig};
+use citrea_evm::smart_contracts::{
+    CallerContract, LogsContract, SimpleStorageContract, TestContract,
+};
+use citrea_evm::system_contracts::BitcoinLightClient;
+use citrea_stf::genesis_config::GenesisPaths;
+use sha2::Digest;
+use sov_mock_da::{MockAddress, MockDaService};
+use sov_rollup_interface::CITREA_VERSION;
+use sov_state::KeyHash;
+use tokio::time::sleep;
+
+// use sov_demo_rollup::initialize_logging;
+use crate::common::client::TestClient;
+use crate::common::helpers::{
+    create_default_rollup_config, start_rollup, tempdir_with_children, wait_for_commitment,
+    wait_for_l1_block, wait_for_l2_block, wait_for_proof, wait_for_prover_job,
+    wait_for_prover_l1_height, NodeMode,
+};
+use crate::common::{
+    make_test_client, TEST_DATA_GENESIS_PATH, TEST_SEND_NO_COMMITMENT_MAX_L2_BLOCKS_PER_COMMITMENT,
+};
+
+mod archival_state;
+mod diff_sizes;
+mod eth_call_gas_cap;
+mod fee;
+mod gas_price;
+mod precompiles;
+mod subscription;
+mod tracing;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web3_rpc_tests() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequener_config = SequencerConfig::default();
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequener_config),
+        None,
+        false,
+    )
+    .await;
+
+    // Wait for rollup task to start:
+    let port = port_rx.await.unwrap();
+
+    let test_client = make_test_client(port).await?;
+
+    let arch = std::env::consts::ARCH;
+
+    assert_eq!(
+        test_client.web3_client_version().await,
+        format!(
+            "citrea/{}/{}/rust-{}",
+            CITREA_VERSION,
+            arch,
+            rustc_version_runtime::version()
+        )
+    );
+    assert_eq!(
+        test_client
+            .web3_sha3("0x68656c6c6f20776f726c64".to_string())
+            .await,
+        "0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad".to_string()
+    );
+
+    rollup_task.graceful_shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evm_tx_tests() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: TEST_SEND_NO_COMMITMENT_MAX_L2_BLOCKS_PER_COMMITMENT,
+        ..Default::default()
+    };
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    // Wait for rollup task to start:
+    let port = port_rx.await.unwrap();
+    send_tx_test_to_eth(port).await.unwrap();
+    rollup_task.graceful_shutdown();
+    Ok(())
+}
+
+async fn send_tx_test_to_eth(rpc_address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let test_client = init_test_rollup(rpc_address).await;
+    execute(&test_client).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth_get_logs_and_filter_proofs() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(::tracing::Level::INFO);
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let mut rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    // Enable filters for this test
+    rollup_config.rpc.enable_filters = true;
+    let sequencer_config = SequencerConfig::default();
+
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    // Wait for rollup task to start:
+    let port = port_rx.await.unwrap();
+
+    let test_client = init_test_rollup(port).await;
+
+    test_getlogs(&test_client).await.unwrap();
+
+    rollup_task.graceful_shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_genesis_contract_call() -> Result<(), Box<dyn std::error::Error>> {
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 123456,
+        ..Default::default()
+    };
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir("../../resources/genesis/mock/"),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = make_test_client(seq_port).await?;
+    // call the contract with address 0x3100000000000000000000000000000000000001
+    let contract_address = Address::from_str("0x3100000000000000000000000000000000000001").unwrap();
+
+    let code = seq_test_client
+        .eth_get_code(contract_address, None)
+        .await
+        .unwrap();
+
+    let expected_code = "60806040523661001357610011610017565b005b6100115b61001f610168565b6001600160a01b0316330361015e5760606001600160e01b03195f35166364d3180d60e11b81016100595761005261019a565b9150610156565b63587086bd60e11b6001600160e01b0319821601610079576100526101ed565b63070d7c6960e41b6001600160e01b031982160161009957610052610231565b621eb96f60e61b6001600160e01b03198216016100b857610052610261565b63a39f25e560e01b6001600160e01b03198216016100d8576100526102a0565b60405162461bcd60e51b815260206004820152604260248201527f5472616e73706172656e745570677261646561626c6550726f78793a2061646d60448201527f696e2063616e6e6f742066616c6c6261636b20746f2070726f78792074617267606482015261195d60f21b608482015260a4015b60405180910390fd5b815160208301f35b6101666102b3565b565b5f7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035b546001600160a01b0316919050565b60606101a46102c3565b5f6101b23660048184610668565b8101906101bf91906106aa565b90506101da8160405180602001604052805f8152505f6102cd565b505060408051602081019091525f815290565b60605f806101fe3660048184610668565b81019061020b91906106d7565b9150915061021b828260016102cd565b60405180602001604052805f8152509250505090565b606061023b6102c3565b5f6102493660048184610668565b81019061025691906106aa565b90506101da816102f8565b606061026b6102c3565b5f610274610168565b604080516001600160a01b03831660208201529192500160405160208183030381529060405291505090565b60606102aa6102c3565b5f61027461034f565b6101666102be61034f565b61035d565b3415610166575f5ffd5b6102d68361037b565b5f825111806102e25750805b156102f3576102f183836103ba565b505b505050565b7f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f610321610168565b604080516001600160a01b03928316815291841660208301520160405180910390a161034c816103e6565b50565b5f61035861048f565b905090565b365f5f375f5f365f845af43d5f5f3e808015610377573d5ff35b3d5ffd5b610384816104b6565b6040516001600160a01b038216907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b905f90a250565b60606103df83836040518060600160405280602781526020016107e76027913961054a565b9392505050565b6001600160a01b03811661044b5760405162461bcd60e51b815260206004820152602660248201527f455243313936373a206e65772061646d696e20697320746865207a65726f206160448201526564647265737360d01b606482015260840161014d565b807fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035b80546001600160a01b0319166001600160a01b039290921691909117905550565b5f7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc61018b565b6001600160a01b0381163b6105235760405162461bcd60e51b815260206004820152602d60248201527f455243313936373a206e657720696d706c656d656e746174696f6e206973206e60448201526c1bdd08184818dbdb9d1c9858dd609a1b606482015260840161014d565b807f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc61046e565b60605f5f856001600160a01b031685604051610566919061079b565b5f60405180830381855af49150503d805f811461059e576040519150601f19603f3d011682016040523d82523d5f602084013e6105a3565b606091505b50915091506105b4868383876105be565b9695505050505050565b6060831561062c5782515f03610625576001600160a01b0385163b6106255760405162461bcd60e51b815260206004820152601d60248201527f416464726573733a2063616c6c20746f206e6f6e2d636f6e7472616374000000604482015260640161014d565b5081610636565b610636838361063e565b949350505050565b81511561064e5781518083602001fd5b8060405162461bcd60e51b815260040161014d91906107b1565b5f5f85851115610676575f5ffd5b83861115610682575f5ffd5b5050820193919092039150565b80356001600160a01b03811681146106a5575f5ffd5b919050565b5f602082840312156106ba575f5ffd5b6103df8261068f565b634e487b7160e01b5f52604160045260245ffd5b5f5f604083850312156106e8575f5ffd5b6106f18361068f565b9150602083013567ffffffffffffffff81111561070c575f5ffd5b8301601f8101851361071c575f5ffd5b803567ffffffffffffffff811115610736576107366106c3565b604051601f8201601f19908116603f0116810167ffffffffffffffff81118282101715610765576107656106c3565b60405281815282820160200187101561077c575f5ffd5b816020840160208301375f602083830101528093505050509250929050565b5f82518060208501845e5f920191825250919050565b602081525f82518060208401528060208501604085015e5f604082850101526040601f19601f8301168401019150509291505056fe416464726573733a206c6f772d6c6576656c2064656c65676174652063616c6c206661696c6564";
+    assert_eq!(code.to_vec(), hex::decode(expected_code).unwrap());
+
+    let res: String = seq_test_client
+        .contract_call(
+            contract_address,
+            BitcoinLightClient::get_system_caller().into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let expected_res = "0x000000000000000000000000deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+    assert_eq!(res, expected_res);
+
+    let storage_value = seq_test_client
+        .eth_get_storage_at(
+            contract_address,
+            U256::from_str("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
+                .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        storage_value,
+        U256::from_str("0x0000000000000000000000003200000000000000000000000000000000000001")
+            .unwrap()
+    );
+
+    seq_task.graceful_shutdown();
+    Ok(())
+}
+
+fn check_proof(acc_proof: &EIP1186AccountProofResponse, account_address: Address) {
+    // println!("root: {:?}", acc_proof.storage_hash);
+    // println!("proof: {:?}", acc_proof);
+
+    // Verify proof:
+    let expected_root_hash = acc_proof.storage_hash.0.into();
+
+    // construct account key/values to be verified
+    dbg!("verify proof acc");
+    let account_key = [b"E/i/", account_address.as_slice()].concat();
+    let account_hash = KeyHash::with::<sha2::Sha256>(account_key.clone());
+
+    if acc_proof.account_proof.len() == 2 {
+        // Neither account index nor account exist
+        assert_eq!(acc_proof.account_proof[1], Bytes::from("n"));
+
+        let acc_storage_proof: jmt::proof::SparseMerkleProof<sha2::Sha256> =
+            borsh::from_slice(&acc_proof.account_proof[0]).unwrap();
+
+        acc_storage_proof
+            .verify(expected_root_hash, account_hash, None::<Vec<u8>>)
+            .expect("Account proof must be valid");
+    } else {
+        // index_proof, index_bytes, account_proof, account_exists
+        assert_eq!(acc_proof.account_proof.len(), 4);
+
+        let proved_index_value = acc_proof.account_proof[1].to_vec();
+        let account_idx = usize::from_le_bytes(
+            proved_index_value
+                .clone()
+                .try_into()
+                .expect("Must be exactly 8 bytes"),
+        );
+
+        let acc_index_proof: jmt::proof::SparseMerkleProof<sha2::Sha256> =
+            borsh::from_slice(&acc_proof.account_proof[0]).unwrap();
+
+        acc_index_proof
+            .verify(expected_root_hash, account_hash, Some(proved_index_value))
+            .expect("Account proof index must be valid");
+
+        let proved_account = if acc_proof.account_proof[3] == Bytes::from("y") {
+            dbg!("acc exists");
+            // Account exists and it's serialized form is:
+            let code_hash_bytes = if acc_proof.code_hash != KECCAK_EMPTY {
+                // 1 for Some
+                [&[1], acc_proof.code_hash.0.as_slice()].concat()
+            } else {
+                // 0 for None
+                vec![0]
+            };
+            let bytes = [
+                acc_proof.balance.as_le_slice(),
+                &acc_proof.nonce.to_le_bytes(),
+                &code_hash_bytes,
+            ]
+            .concat();
+            Some(bytes)
+        } else {
+            // Account does not exist
+            dbg!("acc does not exist");
+            None
+        };
+
+        let index_key = [b"E/a/", account_idx.to_le_bytes().as_slice()].concat();
+        let index_hash = KeyHash::with::<sha2::Sha256>(index_key.clone());
+
+        let acc_proof: jmt::proof::SparseMerkleProof<sha2::Sha256> =
+            borsh::from_slice(&acc_proof.account_proof[2]).unwrap();
+
+        acc_proof
+            .verify(expected_root_hash, index_hash, proved_account)
+            .expect("Account proof must be valid");
+    }
+
+    for storage_proof in &acc_proof.storage_proof {
+        let kaddr = {
+            // See `Evm::get_storage_address` for how the storage address is calculated
+            let mut hasher: sha2::Sha256 =
+                sha2::Digest::new_with_prefix(account_address.as_slice());
+            #[allow(clippy::unnecessary_fallible_conversions)]
+            hasher.update(
+                U256::try_from(storage_proof.key.as_b256())
+                    .unwrap()
+                    .as_le_slice(),
+            );
+            let arr = hasher.finalize();
+            U256::from_le_slice(&arr)
+        };
+        let storage_key = [b"E/s/".as_slice(), kaddr.as_le_slice()].concat();
+        let key_hash = KeyHash::with::<sha2::Sha256>(storage_key.clone());
+
+        let proved_value = if storage_proof.proof[1] == Bytes::from("y") {
+            dbg!("storage exists");
+            // Storage value exists and it's serialized form is:
+            let bytes = storage_proof.value.as_le_bytes().to_vec();
+            Some(bytes)
+        } else {
+            // Storage value does not exist
+            dbg!("storage does not exist");
+            None
+        };
+
+        let storage_proof: jmt::proof::SparseMerkleProof<sha2::Sha256> =
+            borsh::from_slice(&storage_proof.proof[0]).unwrap();
+
+        storage_proof
+            .verify(expected_root_hash, key_hash, proved_value)
+            .expect("Account storage proof must be valid");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth_get_proof() -> Result<(), Box<dyn std::error::Error>> {
+    // citrea::initialize_logging(::tracing::Level::INFO);
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 123456,
+        ..Default::default()
+    };
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir("../../resources/genesis/mock/"),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = make_test_client(seq_port).await?;
+    // call the contract with address 0x3100000000000000000000000000000000000001
+    let contract_address = Address::from_str("0x3100000000000000000000000000000000000001").unwrap();
+
+    let code = seq_test_client
+        .eth_get_code(contract_address, None)
+        .await
+        .unwrap();
+
+    let expected_code = "60806040523661001357610011610017565b005b6100115b61001f610168565b6001600160a01b0316330361015e5760606001600160e01b03195f35166364d3180d60e11b81016100595761005261019a565b9150610156565b63587086bd60e11b6001600160e01b0319821601610079576100526101ed565b63070d7c6960e41b6001600160e01b031982160161009957610052610231565b621eb96f60e61b6001600160e01b03198216016100b857610052610261565b63a39f25e560e01b6001600160e01b03198216016100d8576100526102a0565b60405162461bcd60e51b815260206004820152604260248201527f5472616e73706172656e745570677261646561626c6550726f78793a2061646d60448201527f696e2063616e6e6f742066616c6c6261636b20746f2070726f78792074617267606482015261195d60f21b608482015260a4015b60405180910390fd5b815160208301f35b6101666102b3565b565b5f7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035b546001600160a01b0316919050565b60606101a46102c3565b5f6101b23660048184610668565b8101906101bf91906106aa565b90506101da8160405180602001604052805f8152505f6102cd565b505060408051602081019091525f815290565b60605f806101fe3660048184610668565b81019061020b91906106d7565b9150915061021b828260016102cd565b60405180602001604052805f8152509250505090565b606061023b6102c3565b5f6102493660048184610668565b81019061025691906106aa565b90506101da816102f8565b606061026b6102c3565b5f610274610168565b604080516001600160a01b03831660208201529192500160405160208183030381529060405291505090565b60606102aa6102c3565b5f61027461034f565b6101666102be61034f565b61035d565b3415610166575f5ffd5b6102d68361037b565b5f825111806102e25750805b156102f3576102f183836103ba565b505b505050565b7f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f610321610168565b604080516001600160a01b03928316815291841660208301520160405180910390a161034c816103e6565b50565b5f61035861048f565b905090565b365f5f375f5f365f845af43d5f5f3e808015610377573d5ff35b3d5ffd5b610384816104b6565b6040516001600160a01b038216907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b905f90a250565b60606103df83836040518060600160405280602781526020016107e76027913961054a565b9392505050565b6001600160a01b03811661044b5760405162461bcd60e51b815260206004820152602660248201527f455243313936373a206e65772061646d696e20697320746865207a65726f206160448201526564647265737360d01b606482015260840161014d565b807fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035b80546001600160a01b0319166001600160a01b039290921691909117905550565b5f7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc61018b565b6001600160a01b0381163b6105235760405162461bcd60e51b815260206004820152602d60248201527f455243313936373a206e657720696d706c656d656e746174696f6e206973206e60448201526c1bdd08184818dbdb9d1c9858dd609a1b606482015260840161014d565b807f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc61046e565b60605f5f856001600160a01b031685604051610566919061079b565b5f60405180830381855af49150503d805f811461059e576040519150601f19603f3d011682016040523d82523d5f602084013e6105a3565b606091505b50915091506105b4868383876105be565b9695505050505050565b6060831561062c5782515f03610625576001600160a01b0385163b6106255760405162461bcd60e51b815260206004820152601d60248201527f416464726573733a2063616c6c20746f206e6f6e2d636f6e7472616374000000604482015260640161014d565b5081610636565b610636838361063e565b949350505050565b81511561064e5781518083602001fd5b8060405162461bcd60e51b815260040161014d91906107b1565b5f5f85851115610676575f5ffd5b83861115610682575f5ffd5b5050820193919092039150565b80356001600160a01b03811681146106a5575f5ffd5b919050565b5f602082840312156106ba575f5ffd5b6103df8261068f565b634e487b7160e01b5f52604160045260245ffd5b5f5f604083850312156106e8575f5ffd5b6106f18361068f565b9150602083013567ffffffffffffffff81111561070c575f5ffd5b8301601f8101851361071c575f5ffd5b803567ffffffffffffffff811115610736576107366106c3565b604051601f8201601f19908116603f0116810167ffffffffffffffff81118282101715610765576107656106c3565b60405281815282820160200187101561077c575f5ffd5b816020840160208301375f602083830101528093505050509250929050565b5f82518060208501845e5f920191825250919050565b602081525f82518060208401528060208501604085015e5f604082850101526040601f19601f8301168401019150509291505056fe416464726573733a206c6f772d6c6576656c2064656c65676174652063616c6c206661696c6564";
+    assert_eq!(code.to_vec(), hex::decode(expected_code).unwrap());
+
+    let res: String = seq_test_client
+        .contract_call(
+            contract_address,
+            BitcoinLightClient::get_system_caller().into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let expected_res = "0x000000000000000000000000deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+    assert_eq!(res, expected_res);
+
+    let contract_field =
+        U256::from_str("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
+            .unwrap();
+
+    let storage_value = seq_test_client
+        .eth_get_storage_at(contract_address, contract_field, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage_value,
+        U256::from_str("0x0000000000000000000000003200000000000000000000000000000000000001")
+            .unwrap()
+    );
+
+    let non_existing_field = U256::from(42);
+    let non_existing_value = seq_test_client
+        .eth_get_storage_at(contract_address, non_existing_field, None)
+        .await
+        .unwrap();
+    assert_eq!(non_existing_value, U256::ZERO);
+
+    let acc_proof_latest = seq_test_client
+        .eth_get_proof(
+            contract_address,
+            vec![contract_field, non_existing_field],
+            None,
+        )
+        .await
+        .unwrap();
+
+    {
+        check_proof(&acc_proof_latest, contract_address);
+        for storage_proof in &acc_proof_latest.storage_proof {
+            if U256::from_le_slice(storage_proof.key.as_b256().as_slice()) == contract_field {
+                // A sanity check to verify we deal with the same value.
+                // This check is not actually required, it's for test purposes only
+                assert_eq!(storage_proof.value, storage_value);
+            }
+        }
+    }
+
+    seq_test_client.send_publish_batch_request().await;
+
+    sleep(Duration::from_secs(1)).await;
+
+    let block_num = seq_test_client.eth_block_number().await;
+
+    let acc_proof_1 = seq_test_client
+        .eth_get_proof(
+            contract_address,
+            vec![contract_field, non_existing_field],
+            Some(BlockNumberOrTag::Number(block_num)),
+        )
+        .await
+        .unwrap();
+
+    let acc_proof_2 = seq_test_client
+        .eth_get_proof(
+            contract_address,
+            vec![contract_field, non_existing_field],
+            Some(BlockNumberOrTag::Number(block_num - 1)),
+        )
+        .await
+        .unwrap();
+
+    {
+        check_proof(&acc_proof_1, contract_address);
+        for storage_proof in &acc_proof_1.storage_proof {
+            if U256::from_le_slice(storage_proof.key.as_b256().as_slice()) == contract_field {
+                // A sanity check to verify we deal with the same value.
+                // This check is not actually required, it's for test purposes only
+                assert_eq!(storage_proof.value, storage_value);
+            }
+        }
+    }
+
+    {
+        // Assert historic proof is not the same as the first one queried
+        //  because storage root is different -> all proofs are different too.
+        assert_ne!(acc_proof_1, acc_proof_2);
+        check_proof(&acc_proof_2, contract_address);
+        for storage_proof in &acc_proof_2.storage_proof {
+            if U256::from_le_slice(storage_proof.key.as_b256().as_slice()) == contract_field {
+                // A sanity check to verify we deal with the same value.
+                // This check is not actually required, it's for test purposes only
+                assert_eq!(storage_proof.value, storage_value);
+            }
+        }
+    }
+
+    {
+        // Assert historic proof is the same as the first one queried.
+        assert_eq!(acc_proof_latest, acc_proof_2);
+    }
+
+    // Count every requested key, including duplicates, and reject before resolving the block.
+    for block in [
+        None,
+        Some(BlockNumberOrTag::Latest),
+        Some(BlockNumberOrTag::Pending),
+        Some(BlockNumberOrTag::Number(u64::MAX)),
+    ] {
+        for keys in [
+            vec![U256::ZERO; 1025],
+            (0u64..1025).map(U256::from).collect(),
+        ] {
+            let err = seq_test_client
+                .eth_get_proof(contract_address, keys, block)
+                .await
+                .map(|_| ())
+                .expect_err("eth_getProof must reject more than 1024 storage keys");
+            let err = err.downcast::<jsonrpsee::core::client::Error>()?;
+            let jsonrpsee::core::client::Error::Call(err) = err.as_ref() else {
+                panic!("expected a JSON-RPC error, got {err}");
+            };
+            assert_eq!(err.code(), -32602);
+            assert_eq!(
+                err.message(),
+                "too many storage keys requested (max 1024, got 1025)"
+            );
+        }
+    }
+
+    // Account-only proofs and the inclusive storage-key boundary must still work.
+    for keys in [vec![], (0u64..1024).map(U256::from).collect()] {
+        let proof = seq_test_client
+            .eth_get_proof(contract_address, keys.clone(), None)
+            .await?;
+        assert_eq!(proof.storage_proof.len(), keys.len());
+        for (entry, key) in proof.storage_proof.iter().zip(keys) {
+            assert_eq!(entry.key.as_b256(), B256::from(key));
+        }
+        check_proof(&proof, contract_address);
+    }
+
+    seq_task.graceful_shutdown();
+    Ok(())
+}
+
+#[allow(clippy::borrowed_box)]
+async fn test_getlogs(client: &Box<TestClient>) -> Result<(), Box<dyn std::error::Error>> {
+    let (contract_address, contract) = {
+        let contract = LogsContract::default();
+        let deploy_contract_req = client.deploy_contract(contract.byte_code(), None).await?;
+
+        client.send_publish_batch_request().await;
+
+        let contract_address = deploy_contract_req
+            .get_receipt()
+            .await?
+            .contract_address
+            .unwrap();
+
+        (contract_address, contract)
+    };
+
+    let _pending_tx = client
+        .contract_transaction(
+            contract_address,
+            contract.publish_event("hello".to_string()),
+            None,
+        )
+        .await;
+    client.send_publish_batch_request().await;
+    wait_for_l2_block(client, 2, None).await;
+    let empty_filter_id = client
+        .install_filter(
+            Filter::default()
+                .from_block(BlockNumberOrTag::Latest)
+                .to_block(BlockNumberOrTag::Latest),
+        )
+        .await
+        .unwrap();
+    let empty_filter = serde_json::json!({});
+    // supposed to get all the logs
+    let logs = client.eth_get_logs(empty_filter).await;
+
+    // Should get the same logs as the eth_get_logs
+    let filter_changes = client.get_filter_changes(empty_filter_id).await.unwrap();
+    assert_eq!(filter_changes.as_logs().unwrap().to_vec(), logs);
+
+    assert_eq!(logs.len(), 2);
+
+    let one_topic_filter = serde_json::json!({
+        "topics": [
+            "0xa9943ee9804b5d456d8ad7b3b1b975a5aefa607e16d13936959976e776c4bec7"
+        ]
+    });
+    // supposed to get the first log only
+    let logs = client.eth_get_logs(one_topic_filter).await;
+
+    let one_topic_filter_id = client
+        .install_filter(
+            Filter::default()
+                .from_block(BlockNumberOrTag::Latest)
+                .to_block(BlockNumberOrTag::Latest)
+                .event_signature(
+                    U256::from_str(
+                        "0xa9943ee9804b5d456d8ad7b3b1b975a5aefa607e16d13936959976e776c4bec7",
+                    )
+                    .unwrap(),
+                ),
+        )
+        .await
+        .unwrap();
+
+    let filter_logs = client
+        .get_filter_logs(one_topic_filter_id.clone())
+        .await
+        .unwrap();
+
+    let filter_changes = client
+        .get_filter_changes(one_topic_filter_id)
+        .await
+        .unwrap();
+
+    // Assert correctness with all three methods
+    assert_eq!(filter_changes.as_logs().unwrap().to_vec(), logs);
+    assert_eq!(logs, filter_logs);
+
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        hex::encode(logs[0].topics()[0]).to_string(),
+        "a9943ee9804b5d456d8ad7b3b1b975a5aefa607e16d13936959976e776c4bec7"
+    );
+
+    let sepolia_log_data = "\"0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000c48656c6c6f20576f726c64210000000000000000000000000000000000000000\"".to_string();
+    let len = sepolia_log_data.len();
+    assert_eq!(
+        sepolia_log_data[1..len - 1],
+        logs[0].data().data.to_string()
+    );
+
+    // Deploy another contract
+    let contract_address2 = {
+        let deploy_contract_req = client.deploy_contract(contract.byte_code(), None).await?;
+        client.send_publish_batch_request().await;
+        wait_for_l2_block(client, 2, None).await;
+
+        deploy_contract_req
+            .get_receipt()
+            .await?
+            .contract_address
+            .unwrap()
+    };
+
+    // call the second contract again
+    let _pending_tx = client
+        .contract_transaction(
+            contract_address2,
+            contract.publish_event("second contract".to_string()),
+            None,
+        )
+        .await;
+    client.send_publish_batch_request().await;
+    wait_for_l2_block(client, 3, None).await;
+
+    // make sure the two contracts have different addresses
+    assert_ne!(contract_address, contract_address2);
+
+    // without any range or blockhash default behaviour is checking the latest block
+    let just_address_filter = serde_json::json!({
+        "address": contract_address
+    });
+
+    let just_address_filter_id = client
+        .install_filter(
+            Filter::default()
+                .address(ValueOrArray::Value(contract_address))
+                .from_block(BlockNumberOrTag::Latest)
+                .to_block(BlockNumberOrTag::Latest),
+        )
+        .await
+        .unwrap();
+
+    let filter_logs = client
+        .get_filter_logs(just_address_filter_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(filter_logs.len(), 0);
+
+    let filter_changes = client
+        .get_filter_changes(just_address_filter_id)
+        .await
+        .unwrap();
+    // Should be none
+    assert!(filter_changes.as_logs().is_none());
+
+    let logs = client.eth_get_logs(just_address_filter).await;
+    // supposed to get both the logs coming from the contract
+    assert_eq!(logs.len(), 0);
+
+    // now we need to get all the logs with the first contract address
+    let address_and_range_filter = serde_json::json!({
+        "address": contract_address,
+        "fromBlock": "0x1",
+        "toBlock": "0x4"
+    });
+
+    let address_and_range_filter_id = client
+        .install_filter(
+            Filter::default()
+                .address(ValueOrArray::Value(contract_address))
+                .from_block(BlockNumberOrTag::Number(1))
+                .to_block(BlockNumberOrTag::Number(4)),
+        )
+        .await
+        .unwrap();
+
+    let filter_logs = client
+        .get_filter_logs(address_and_range_filter_id.clone())
+        .await
+        .unwrap();
+
+    let filter_changes = client
+        .get_filter_changes(address_and_range_filter_id)
+        .await
+        .unwrap();
+
+    let logs = client.eth_get_logs(address_and_range_filter).await;
+    // Assert correctness with all three methods
+    assert_eq!(filter_changes.as_logs().unwrap().to_vec(), logs);
+    assert_eq!(logs, filter_logs);
+    assert_eq!(logs.len(), 2);
+    // make sure the address is the old one and not the new one
+    assert_eq!(logs[0].address(), contract_address);
+    assert_eq!(logs[1].address(), contract_address);
+
+    Ok(())
+}
+
+#[allow(clippy::borrowed_box)]
+async fn execute(client: &Box<TestClient>) -> Result<(), Box<dyn std::error::Error>> {
+    // Nonce should be 0 in genesis
+    let nonce = client
+        .eth_get_transaction_count(client.from_addr, None)
+        .await
+        .unwrap();
+    assert_eq!(0, nonce);
+
+    // Balance should be > 0 in genesis
+    let balance = client
+        .eth_get_balance(client.from_addr, None)
+        .await
+        .unwrap();
+    assert!(balance > U256::from(0));
+
+    let (contract_address, contract, runtime_code) = {
+        let contract = SimpleStorageContract::default();
+
+        let runtime_code = client
+            .deploy_contract_call(contract.byte_code(), None)
+            .await?;
+        let deploy_contract_req = client.deploy_contract(contract.byte_code(), None).await?;
+        client.send_publish_batch_request().await;
+
+        let contract_address = deploy_contract_req
+            .get_receipt()
+            .await?
+            .contract_address
+            .unwrap();
+
+        (contract_address, contract, runtime_code)
+    };
+
+    // Assert contract deployed correctly
+    let code = client.eth_get_code(contract_address, None).await.unwrap();
+    // code has natural following 0x00 bytes, so we need to trim it
+    assert_eq!(code.to_vec()[..runtime_code.len()], runtime_code.to_vec());
+
+    // Nonce should be 1 after the deploy
+    let nonce = client
+        .eth_get_transaction_count(client.from_addr, None)
+        .await
+        .unwrap();
+    assert_eq!(1, nonce);
+
+    // Check that the first block has published
+    // It should have a single transaction, deploying the contract
+    let first_block = client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(1)))
+        .await;
+    assert_eq!(first_block.header.number, 1);
+    assert_eq!(first_block.transactions.len(), 4);
+
+    let set_arg = 923;
+    let tx_hash = {
+        let set_value_req = client
+            .contract_transaction(contract_address, contract.set_call_data(set_arg), None)
+            .await;
+        client.send_publish_batch_request().await;
+        set_value_req.get_receipt().await.unwrap().transaction_hash
+    };
+    // Now we have a second block
+    let second_block = client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(2)))
+        .await;
+    assert_eq!(second_block.header.number, 2);
+
+    // Assert getTransactionByBlockHashAndIndex
+    let tx_by_hash = client
+        .eth_get_tx_by_block_hash_and_index(second_block.header.hash, U256::from(0))
+        .await;
+    assert_eq!(tx_by_hash.tx_hash(), tx_hash);
+
+    // Assert getTransactionByBlockNumberAndIndex
+    let tx_by_number = client
+        .eth_get_tx_by_block_number_and_index(BlockNumberOrTag::Number(2), U256::from(0))
+        .await;
+    let tx_by_number_tag = client
+        .eth_get_tx_by_block_number_and_index(BlockNumberOrTag::Latest, U256::from(0))
+        .await;
+    assert_eq!(tx_by_number.tx_hash(), tx_hash);
+    assert_eq!(tx_by_number_tag.tx_hash(), tx_hash);
+
+    // Assert getRawTransactionByBlockHashAndIndex
+    let raw_tx_by_block_hash = client
+        .eth_get_raw_tx_by_block_hash_and_index(second_block.header.hash, U64::from(0))
+        .await;
+    assert!(raw_tx_by_block_hash.is_some());
+    // Verify the raw bytes hash to the correct transaction hash
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_block_hash.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by block hash should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockHashAndIndex with invalid index returns None
+    let raw_tx_invalid_index = client
+        .eth_get_raw_tx_by_block_hash_and_index(second_block.header.hash, U64::from(99))
+        .await;
+    assert!(raw_tx_invalid_index.is_none());
+
+    // Assert getRawTransactionByBlockHashAndIndex with non-existent block hash returns None
+    let raw_tx_invalid_block = client
+        .eth_get_raw_tx_by_block_hash_and_index(B256::ZERO, U64::from(0))
+        .await;
+    assert!(raw_tx_invalid_block.is_none());
+
+    // Assert getRawTransactionByBlockNumberAndIndex
+    let raw_tx_by_number = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Number(2), U64::from(0))
+        .await;
+    assert!(raw_tx_by_number.is_some());
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_number.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by block number should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockNumberAndIndex with Latest tag
+    let raw_tx_by_latest = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Latest, U64::from(0))
+        .await;
+    assert!(raw_tx_by_latest.is_some());
+    assert_eq!(
+        alloy::primitives::keccak256(raw_tx_by_latest.as_ref().unwrap()),
+        tx_hash,
+        "Raw tx by Latest tag should hash to the original transaction hash"
+    );
+
+    // Assert getRawTransactionByBlockNumberAndIndex with invalid index returns None
+    let raw_tx_invalid_num_index = client
+        .eth_get_raw_tx_by_block_number_and_index(BlockNumberOrTag::Number(2), U64::from(99))
+        .await;
+    assert!(raw_tx_invalid_num_index.is_none());
+
+    // Verify both block-based raw transaction methods return the same bytes
+    assert_eq!(
+        raw_tx_by_block_hash.as_ref().unwrap(),
+        raw_tx_by_number.as_ref().unwrap(),
+        "Raw tx by block hash and by block number should be identical"
+    );
+
+    // Assert getRawTransactionByHash
+    let raw_tx_by_hash = client.eth_get_raw_transaction_by_hash(tx_hash, None).await;
+    assert!(raw_tx_by_hash.is_some());
+
+    // Encode the transaction locally and verify it matches the RPC response
+    let tx_obj = client
+        .eth_get_transaction_by_hash(tx_hash, None)
+        .await
+        .expect("Transaction should exist");
+    let locally_encoded: Bytes = tx_obj.inner.encoded_2718().into();
+    assert_eq!(
+        raw_tx_by_hash.as_ref().unwrap(),
+        &locally_encoded,
+        "Raw tx by hash should match locally encoded transaction bytes"
+    );
+
+    // Also verify consistency with block-based raw transaction methods
+    assert_eq!(
+        raw_tx_by_hash.as_ref().unwrap(),
+        raw_tx_by_block_hash.as_ref().unwrap(),
+        "Raw tx by hash and by block hash should be identical"
+    );
+
+    // Assert getRawTransactionByHash with non-existent hash returns None
+    let raw_tx_nonexistent = client
+        .eth_get_raw_transaction_by_hash(B256::ZERO, None)
+        .await;
+    assert!(raw_tx_nonexistent.is_none());
+
+    let get_arg: U256 = client
+        .contract_call(contract_address, contract.get_call_data(), None)
+        .await?;
+
+    assert_eq!(set_arg, get_arg.saturating_to::<u32>());
+
+    // Assert storage slot is set
+    let storage_slot = 0x0;
+    let storage_value = client
+        .eth_get_storage_at(contract_address, U256::from(storage_slot), None)
+        .await
+        .unwrap();
+    assert_eq!(storage_value, U256::from(set_arg));
+
+    // Check that the second block has published
+    // None should return the latest block
+    // It should have a single transaction, setting the value
+    let latest_block = client.eth_get_block_by_number_with_detail(None).await;
+    let block_transactions: Vec<_> = latest_block.transactions.hashes().clone().collect();
+    assert_eq!(latest_block.header.number, 2);
+    assert_eq!(block_transactions.len(), 1);
+    assert_eq!(block_transactions[0], tx_hash);
+
+    // This should just pass without error
+    let _: Bytes = client
+        .contract_call(contract_address, contract.set_call_data(set_arg), None)
+        .await?;
+
+    // This call should fail because function does not exist
+    let failing_call: Result<Bytes, _> = client
+        .contract_call(
+            contract_address,
+            contract.failing_function_call_data(),
+            None,
+        )
+        .await;
+    assert!(failing_call.is_err());
+
+    // Create a blob with multiple transactions.
+    client.sync_nonce().await; // sync nonce because of failed call
+    let mut requests = Vec::default();
+    for value in 150..153 {
+        let set_value_req = client
+            .contract_transaction(contract_address, contract.set_call_data(value), None)
+            .await;
+        requests.push(set_value_req);
+    }
+
+    client.send_publish_batch_request().await;
+    client.send_publish_batch_request().await;
+    for req in requests {
+        req.get_receipt().await.unwrap();
+    }
+
+    {
+        let get_arg: U256 = client
+            .contract_call(contract_address, contract.get_call_data(), None)
+            .await?;
+        // should be one of three values sent in a single block. 150, 151, or 152
+        assert!((150..=152).contains(&get_arg.saturating_to()));
+    }
+
+    {
+        let value = 103;
+
+        let tx_hash = {
+            let set_value_req = client
+                .contract_transaction(contract_address, contract.set_call_data(value), None)
+                .await;
+
+            client.send_publish_batch_request().await;
+            set_value_req.get_receipt().await.unwrap().transaction_hash
+        };
+
+        let latest_block = client.eth_get_block_by_number(None).await;
+        let block_transactions = latest_block.transactions.as_hashes().unwrap();
+        assert_eq!(block_transactions.len(), 1);
+        assert_eq!(block_transactions[0], tx_hash);
+
+        let latest_block_receipts = client
+            .eth_get_block_receipts(BlockId::Number(BlockNumberOrTag::Latest))
+            .await;
+        let latest_block_receipt_by_number = client
+            .eth_get_block_receipts(BlockId::Number(BlockNumberOrTag::Number(
+                latest_block.header.number,
+            )))
+            .await;
+        assert_eq!(latest_block_receipts, latest_block_receipt_by_number);
+        assert_eq!(latest_block_receipts.len(), 1);
+        assert_eq!(latest_block_receipts[0].transaction_hash, tx_hash);
+        let tx_receipt = client.eth_get_transaction_receipt(tx_hash).await.unwrap();
+        assert_eq!(tx_receipt, latest_block_receipts[0]);
+
+        let get_arg: U256 = client
+            .contract_call(contract_address, contract.get_call_data(), None)
+            .await?;
+
+        assert_eq!(value, get_arg.saturating_to::<u32>());
+    }
+
+    let first_block = client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(0)))
+        .await;
+    let second_block = client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(1)))
+        .await;
+
+    // assert parent hash works correctly
+    assert_eq!(
+        first_block.header.hash, second_block.header.parent_hash,
+        "Parent hash should be the hash of the previous block"
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::borrowed_box)]
+pub async fn init_test_rollup(rpc_address: SocketAddr) -> Box<TestClient> {
+    let test_client = make_test_client(rpc_address).await.unwrap();
+
+    let eth_chain_id = test_client.eth_chain_id().await;
+    assert_eq!(5655, eth_chain_id);
+
+    // No block exists yet
+    let latest_block = test_client.eth_get_block_by_number(None).await;
+    let earliest_block = test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Earliest))
+        .await;
+
+    assert_eq!(latest_block, earliest_block);
+    assert_eq!(latest_block.header.number, 0);
+    test_client
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eip7702_tx_test() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(::tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: TEST_SEND_NO_COMMITMENT_MAX_L2_BLOCKS_PER_COMMITMENT,
+        ..Default::default()
+    };
+    let rollup_task = start_rollup(
+        port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    // Wait for rollup task to start:
+    let port = port_rx.await.unwrap();
+    let test_client = init_test_rollup(port).await;
+
+    test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&test_client, 1, None).await;
+
+    // in a single block, deploy simple storage contract, make eip7702 tx that delegates to the contract
+    // then call the contract to set a value and get it back over eip7702 tx
+
+    let contract = SimpleStorageContract::default();
+
+    let _deploy_tx = test_client
+        .deploy_contract(contract.byte_code(), None)
+        .await
+        .unwrap();
+
+    let contract_address = test_client.from_addr.create(0);
+
+    // random signer for authorization list
+    let delegating_signer = PrivateKeySigner::random();
+
+    let authorization = Authorization {
+        chain_id: U256::from(test_client.chain_id),
+        address: contract_address,
+        nonce: 0,
+    };
+
+    let signature = delegating_signer.sign_hash_sync(&authorization.signature_hash())?;
+    let signed_authorization = authorization.into_signed(signature);
+
+    let set_code_tx = test_client
+        .send_eip7702_transaction(Address::ZERO, vec![], None, vec![signed_authorization])
+        .await
+        .unwrap();
+
+    test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&test_client, 2, None).await;
+
+    let single_auth_receipt = test_client
+        .eth_get_transaction_receipt(*set_code_tx.tx_hash())
+        .await
+        .unwrap();
+
+    let receipts = test_client
+        .eth_get_block_receipts(BlockId::Number(BlockNumberOrTag::Latest))
+        .await;
+
+    assert_eq!(receipts.len(), 2);
+
+    // all successful
+    assert!(receipts.iter().all(|r| r.inner.inner.status()));
+
+    // if we don't do this in a separate block, gas estimation is off since the delegation is not done yet
+    // this also shows estimate gas works
+    let _set_storage_tx = test_client
+        .contract_transaction(
+            delegating_signer.address(),
+            contract.set_call_data(11),
+            None,
+        )
+        .await;
+
+    test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&test_client, 3, None).await;
+
+    let receipts = test_client
+        .eth_get_block_receipts(BlockId::Number(BlockNumberOrTag::Latest))
+        .await;
+
+    assert_eq!(receipts.len(), 1);
+
+    // all successful
+    assert!(receipts.iter().all(|r| r.inner.inner.status()));
+
+    assert_eq!(
+        test_client
+            .eth_get_code(delegating_signer.address(), None)
+            .await
+            .unwrap(),
+        Into::<Bytes>::into(
+            [
+                Bytes::from_hex("0xef0100").unwrap(),
+                Bytes::from(contract_address.to_vec())
+            ]
+            .concat()
+        )
+    );
+
+    // this also shows eth_call works
+    let get_storage_tx: U256 = test_client
+        .contract_call(delegating_signer.address(), contract.get_call_data(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(get_storage_tx, U256::from(11));
+
+    // now let's try a failing auth
+    // followed by a clear delegation tx
+    {
+        let auth = Authorization {
+            chain_id: U256::from(test_client.chain_id),
+            address: contract_address,
+            nonce: 0, // wrong nonce
+        };
+
+        let signature = delegating_signer.sign_hash_sync(&auth.signature_hash())?;
+        let signed_auth_wrong_nonce = auth.into_signed(signature);
+
+        let auth = Authorization {
+            chain_id: U256::from(test_client.chain_id),
+            address: Address::ZERO,
+            nonce: 1,
+        };
+
+        let signature = delegating_signer.sign_hash_sync(&auth.signature_hash())?;
+        let signed_auth_clear_delegation = auth.into_signed(signature);
+
+        let wrong_nonce_and_clear_code_tx = test_client
+            .send_eip7702_transaction(
+                Address::ZERO,
+                vec![],
+                None,
+                vec![signed_auth_wrong_nonce, signed_auth_clear_delegation],
+            )
+            .await
+            .unwrap();
+
+        test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&test_client, 4, None).await;
+
+        let signed_auth_clear_delegation_tx_receipt = test_client
+            .eth_get_transaction_receipt(*wrong_nonce_and_clear_code_tx.tx_hash())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            test_client
+                .eth_get_transaction_count(delegating_signer.address(), None)
+                .await
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(
+            test_client
+                .eth_get_code(delegating_signer.address(), None)
+                .await
+                .unwrap(),
+            Bytes::new()
+        );
+
+        // we expect the second eip7702 tx to have
+        // smaller diff size than the first one
+        // since the first auth in second set code tx
+        // is discarded due to nonce check, there is only one
+        // state change on the authority and as code_hash is cleared and set to None
+        // the state diff is smaller
+        assert!(
+            U64::from_str(
+                signed_auth_clear_delegation_tx_receipt
+                    .other
+                    .get("l1DiffSize")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+                < U64::from_str(
+                    single_auth_receipt
+                        .other
+                        .get("l1DiffSize")
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap()
+        );
+
+        let auth = Authorization {
+            chain_id: U256::from(test_client.chain_id),
+            address: contract_address,
+            nonce: 2,
+        };
+
+        let signature = delegating_signer.sign_hash_sync(&auth.signature_hash())?;
+        let signed_auth = auth.into_signed(signature);
+
+        let set_code_tx = test_client
+            .send_eip7702_transaction(Address::ZERO, vec![], None, vec![signed_auth])
+            .await
+            .unwrap();
+
+        test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&test_client, 5, None).await;
+
+        let last_receipt = test_client
+            .eth_get_transaction_receipt(*set_code_tx.tx_hash())
+            .await
+            .unwrap();
+
+        // remove L1_FEE_OVERHEAD = 2
+        // compressed diff sizes are:
+        // ((53 + 1 * 85) * 32 // 100) = 44 uncompressed
+        // 21 compressed
+        // ((53 + 1 * 85) * 32 // 100 + 1 * 32) = 76 uncompressed
+        // 36 compressed diff size
+        // difference of 32 bytes is the first time adding authority account info
+        // to state
+        // setting back should yield same diff - creation of the authority
+        assert_eq!(
+            U64::from_str(
+                last_receipt
+                    .other
+                    .get("l1DiffSize")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+                + U64::from(15),
+            U64::from_str(
+                single_auth_receipt
+                    .other
+                    .get("l1DiffSize")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    // combine access list with eip7702 tx
+    {
+        // random signer for authorization list
+        let new_signer = PrivateKeySigner::random();
+
+        let authorization = Authorization {
+            chain_id: U256::ZERO, // let's also show chain id 0 works
+            address: contract_address,
+            nonce: 0,
+        };
+
+        let signature = new_signer.sign_hash_sync(&authorization.signature_hash())?;
+        let signed_authorization = authorization.into_signed(signature);
+
+        let _set_code_tx = test_client
+            .send_eip7702_transaction(
+                new_signer.address(),
+                SimpleStorageContract::default().set_call_data(100),
+                None,
+                vec![signed_authorization],
+            )
+            .await
+            .unwrap();
+
+        test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&test_client, 6, None).await;
+
+        assert_eq!(
+            test_client
+                .contract_call::<U256>(new_signer.address(), contract.get_call_data(), None)
+                .await
+                .unwrap(),
+            U256::from(100)
+        );
+
+        assert_eq!(
+            test_client
+                .eth_get_code(new_signer.address(), None)
+                .await
+                .unwrap(),
+            Into::<Bytes>::into(
+                [
+                    Bytes::from_hex("0xef0100").unwrap(),
+                    Bytes::from(contract_address.to_vec())
+                ]
+                .concat()
+            )
+        );
+
+        // deploy caller contract
+        let caller_contract = CallerContract::default();
+
+        let deploy_tx = test_client
+            .deploy_contract(caller_contract.byte_code(), None)
+            .await
+            .unwrap();
+
+        test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&test_client, 7, None).await;
+
+        let caller_contract_address = deploy_tx
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
+
+        let tx_req = TransactionRequest::default()
+            .from(test_client.from_addr)
+            .to(caller_contract_address)
+            .input(
+                caller_contract
+                    .call_set_call_data(new_signer.address(), 500)
+                    .into(),
+            );
+
+        let gas = test_client.eth_estimate_gas(tx_req.clone()).await.unwrap();
+
+        let access_list = test_client
+            .eth_create_access_list(tx_req.clone())
+            .await
+            .unwrap()
+            .access_list;
+
+        let tx_req = tx_req.access_list(access_list);
+
+        let gas_with_access_list = test_client.eth_estimate_gas(tx_req.clone()).await.unwrap();
+
+        assert!(gas > gas_with_access_list);
+    }
+
+    // show multiple authorizations in a single tx have bigger diff size
+    {
+        let mut signed_auths = vec![];
+
+        for _ in 0..5 {
+            let signer = PrivateKeySigner::random();
+
+            let auth = Authorization {
+                chain_id: U256::from(test_client.chain_id),
+                address: contract_address,
+                nonce: 0,
+            };
+
+            let signature = signer.sign_hash_sync(&auth.signature_hash())?;
+            signed_auths.push(auth.into_signed(signature));
+        }
+
+        let set_for_multiple_tx = test_client
+            .send_eip7702_transaction(Address::ZERO, vec![], None, signed_auths)
+            .await
+            .unwrap();
+
+        test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&test_client, 8, None).await;
+
+        let multiple_receipt = test_client
+            .eth_get_transaction_receipt(*set_for_multiple_tx.tx_hash())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            // ((53 + 5 * 85) * 32 // 100 + 5 * 32) * 48 // 100 + 2
+            // 151
+            U64::from_str(
+                multiple_receipt
+                    .other
+                    .get("l1DiffSize")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            // ((53 + 1 * 85) * 32 // 100 + 1 * 32) * 48 // 100 + 2
+            // 38
+            U64::from_str(
+                single_auth_receipt
+                    .other
+                    .get("l1DiffSize")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+                + U64::from(113)
+        )
+    }
+
+    rollup_task.graceful_shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_safe_finalized_tags() {
+    //citrea::initialize_logging(tracing::Level::INFO);
+
+    // Helper function to compare safe and finalized blocks with expected heights
+    // Asserts that the height of the blocks we get by safe and finalized tags match the last committed and proven heights.
+    // Asserts that the blocks we get by safe and finalized tags matches the block at expected heights.
+    // Also checks that for the test address, the nonce at the safe and finalized blocks matches the expected nonce at those heights.
+    async fn compare_with_numbered_params(
+        test_client: &TestClient,
+        expected_safe_block_height: u64,
+        expected_finalized_block_height: u64,
+        test_address: alloy_primitives::Address,
+    ) {
+        let safe_block = test_client
+            .eth_get_block_by_number(Some(BlockNumberOrTag::Safe))
+            .await;
+        let finalized_block = test_client
+            .eth_get_block_by_number(Some(BlockNumberOrTag::Finalized))
+            .await;
+
+        // Check if the safe and finalized blocks match the committed and proven heights
+        let committed_height = test_client.get_last_committed_l2_height().await;
+        assert_eq!(
+            committed_height.unwrap_or_default().height,
+            safe_block.header.number
+        ); // use unwrap_or_default to handle the no commitment case
+        let proven_height = test_client.get_last_proven_l2_height().await;
+        assert_eq!(
+            proven_height.unwrap_or_default().height,
+            finalized_block.header.number
+        ); // use unwrap_or_default to handle the no proof case
+
+        // Check if the safe and finalized blocks match the blocks at expected heights
+        let expected_safe_block = test_client
+            .eth_get_block_by_number(Some(BlockNumberOrTag::Number(expected_safe_block_height)))
+            .await;
+        let expected_finalized_block = test_client
+            .eth_get_block_by_number(Some(BlockNumberOrTag::Number(
+                expected_finalized_block_height,
+            )))
+            .await;
+        assert_eq!(safe_block, expected_safe_block);
+        assert_eq!(finalized_block, expected_finalized_block);
+
+        // To test set_state_to_end_of_evm_block_by_block_id
+        let expected_safe_block_nonce = test_client
+            .eth_get_transaction_count(
+                test_address,
+                Some(BlockId::Number(BlockNumberOrTag::Number(
+                    expected_safe_block_height,
+                ))),
+            )
+            .await
+            .unwrap();
+        let expected_finalized_block_nonce = test_client
+            .eth_get_transaction_count(
+                test_address,
+                Some(BlockId::Number(BlockNumberOrTag::Number(
+                    expected_finalized_block_height,
+                ))),
+            )
+            .await
+            .unwrap();
+        println!(
+            "Expected safe block nonce: {expected_safe_block_nonce}, expected finalized block nonce: {expected_finalized_block_nonce}"
+        );
+
+        let safe_block_nonce = test_client
+            .eth_get_transaction_count(test_address, Some(BlockId::Number(BlockNumberOrTag::Safe)))
+            .await
+            .unwrap();
+        let finalized_block_nonce = test_client
+            .eth_get_transaction_count(
+                test_address,
+                Some(BlockId::Number(BlockNumberOrTag::Finalized)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(finalized_block_nonce, expected_finalized_block_nonce);
+        assert_eq!(safe_block_nonce, expected_safe_block_nonce);
+    }
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "prover", "full-node"]);
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+    let prover_db_dir = storage_dir.path().join("prover").to_path_buf();
+    let fullnode_db_dir = storage_dir.path().join("full-node").to_path_buf();
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig::default();
+
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let test_client = make_test_client(seq_port).await.unwrap();
+
+    let da_service = MockDaService::new(MockAddress::from([0; 32]), &da_db_dir);
+
+    let (prover_node_port_tx, prover_node_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &prover_db_dir,
+        &da_db_dir,
+        NodeMode::Prover(seq_port),
+        None,
+    );
+
+    let prover_node_task = start_rollup(
+        prover_node_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        Some(BatchProverConfig {
+            proving_mode: citrea_common::ProverGuestRunConfig::Execute,
+            // Make it impossible for proving to happen
+            proof_sampling_number: 1_000_000,
+            max_commitments_per_proof: None,
+            sp1_host: SP1HostConfig::from_env().expect("Failed to load SP1HostConfig"),
+        }),
+        None,
+        rollup_config,
+        None,
+        None,
+        false,
+    )
+    .await;
+
+    let prover_node_port = prover_node_port_rx.await.unwrap();
+
+    let prover_client = make_test_client(prover_node_port).await.unwrap();
+
+    let (full_node_port_tx, full_node_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &fullnode_db_dir,
+        &da_db_dir,
+        NodeMode::FullNode(seq_port),
+        None,
+    );
+    let full_node_task = start_rollup(
+        full_node_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        None,
+        None,
+        false,
+    )
+    .await;
+
+    let full_node_port = full_node_port_rx.await.unwrap();
+    let full_node_client = make_test_client(full_node_port).await.unwrap();
+
+    let tx_sender = test_client.from_addr;
+
+    test_client.send_publish_batch_request().await;
+    test_client.send_publish_batch_request().await;
+
+    da_service.publish_test_block().await.unwrap();
+    wait_for_l1_block(&da_service, 2, None).await;
+
+    wait_for_l2_block(&full_node_client, 2, None).await;
+    // No commitment yet, so safe and finalized blocks should be the same, and equal to 0
+    compare_with_numbered_params(&full_node_client, 0, 0, tx_sender).await;
+
+    // send the first transaction to increase the nonce
+    let _ = test_client
+        .send_eth(Address::random(), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+
+    test_client.send_publish_batch_request().await;
+    test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&full_node_client, 4, None).await;
+
+    // wait for commitment at block 3, mockda produces block when it receives a transaction, hence 3
+    let commitments = wait_for_commitment(&da_service, 3, None).await;
+    assert_eq!(commitments.len(), 1);
+    assert_eq!(commitments[0].l2_end_block_number, 4);
+
+    // wait for prover to see commitment, since sampling is too high, proving won't be triggered here
+    wait_for_prover_l1_height(&prover_client, 3, None)
+        .await
+        .unwrap();
+    wait_for_prover_l1_height(&full_node_client, 3, None)
+        .await
+        .unwrap();
+
+    // Full node sees the commitment with l2 end height 4
+    // So the safe block should be 4, and finalized block should be 0
+    // since no proof was produced yet
+    compare_with_numbered_params(&full_node_client, 4, 0, tx_sender).await;
+
+    // Trigger proving via the RPC endpoint
+    let job_ids = prover_client.batch_prover_prove(None).await;
+    assert_eq!(job_ids.len(), 1);
+    let job_id = job_ids[0];
+
+    // wait here until we see from prover's rpc that it finished proving
+    wait_for_prover_job(&prover_client, job_id, None)
+        .await
+        .unwrap();
+    wait_for_proof(&full_node_client, 4, None).await;
+
+    let proofs = full_node_client
+        .ledger_get_verified_batch_proofs_by_slot_height(4)
+        .await
+        .unwrap();
+    assert_eq!(proofs.len(), 1);
+    let proof = &proofs[0];
+    assert_eq!(proof.proof_output.last_l2_height.to::<u64>(), 4);
+
+    // Now that the full node has the proof, finalized block should be 4
+    // and safe block should be 4 as well since there is no new commitment
+    compare_with_numbered_params(&full_node_client, 4, 4, tx_sender).await;
+
+    // send a second transaction to increase the nonce
+    let _ = test_client
+        .send_eth(Address::random(), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        // publish a batch, this will create a new commitment
+        test_client.send_publish_batch_request().await;
+    }
+    let commitments = wait_for_commitment(&da_service, 5, None).await;
+    assert_eq!(commitments.len(), 1);
+    assert_eq!(commitments[0].l2_end_block_number, 8);
+
+    wait_for_prover_l1_height(&full_node_client, 5, None)
+        .await
+        .unwrap();
+    // As we have a new commitment with l2 end block 8, the safe block should be 8,
+    // and finalized block should be 4, since we haven't proven the new commitment yet
+    compare_with_numbered_params(&full_node_client, 8, 4, tx_sender).await;
+
+    seq_task.graceful_shutdown();
+    prover_node_task.graceful_shutdown();
+    full_node_task.graceful_shutdown();
+}

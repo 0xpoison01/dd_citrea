@@ -1,0 +1,39 @@
+[package]
+name = "sov-mock-da"
+description = "Mock implementation of Data Availability layer for testing purposes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+borsh = { workspace = true, features = ["bytes"] }
+bytes = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, optional = true }
+rusqlite = { version = "0.37.0", features = ["bundled"], optional = true }
+serde_json = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true, features = ["attributes"]}
+
+sov-rollup-interface = { path = "../../rollup-interface" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+native = [
+    "dep:rusqlite",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tracing",
+    "sov-rollup-interface/native",
+]

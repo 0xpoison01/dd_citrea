@@ -1,0 +1,964 @@
+use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
+
+use citrea_common::{NodeType, PruningConfig};
+use jmt::storage::TreeWriter;
+use jmt::KeyHash;
+use reth_tasks::TaskManager;
+use sov_db::ledger_db::{LedgerDB, SharedLedgerOps};
+use sov_db::native_db::NativeDB;
+use sov_db::rocks_db_config::RocksdbConfig;
+use sov_db::schema::tables::{
+    CommitmentsByNumber, JmtValues, L2BlockByHash, L2BlockByNumber, L2RangeByL1Height, L2Witness,
+    LightClientProofBySlotNumber, ModuleAccessoryState, ProofsBySlotNumber, ProofsBySlotNumberV2,
+    ProverStateDiffs, SlotByHash, VerifiedBatchProofsBySlotNumber,
+};
+use sov_db::schema::types::l2_block::{StoredL2Block, StoredTransaction};
+use sov_db::schema::types::light_client_proof::{
+    StoredLatestDaState, StoredLightClientProof, StoredLightClientProofOutput,
+};
+use sov_db::schema::types::{L2BlockNumber, SlotNumber};
+use sov_db::state_db::StateDB;
+use sov_schema_db::DB;
+use sov_state::Storage;
+use tokio::sync::broadcast;
+
+use crate::pruning::criteria::{Criteria, DistanceCriteria};
+use crate::pruning::ledger::prune_ledger_db;
+use crate::pruning::native::prune_native_db;
+use crate::pruning::state::prune_state_db;
+use crate::pruning::{Pruner, PrunerService};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pruning_simple_run() {
+    let task_manager = TaskManager::current();
+    let task_executor = task_manager.executor();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap();
+    {
+        let (sender, receiver) = broadcast::channel(1);
+
+        let native_db = NativeDB::setup_schema_db(&rocksdb_config).unwrap();
+        let state_db = StateDB::setup_schema_db(&rocksdb_config).unwrap();
+
+        let pruner = Pruner::new(
+            PruningConfig { distance: 5 },
+            ledger_db.inner(),
+            Arc::new(state_db),
+            Arc::new(native_db),
+        );
+        let pruner_service = PrunerService::new(pruner, 0, receiver);
+
+        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| {
+            pruner_service.run(NodeType::Sequencer, shutdown)
+        });
+
+        sleep(Duration::from_secs(1));
+
+        for i in 1..=10 {
+            let _ = sender.send(i);
+        }
+
+        sleep(Duration::from_secs(1));
+
+        task_manager.graceful_shutdown();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let storage_manager =
+        sov_prover_storage_manager::ProverStorageManager::new(sov_state::Config {
+            path: tmpdir.path().to_path_buf(),
+            db_max_open_files: None,
+        })
+        .unwrap();
+    let finalized_storage = storage_manager.create_final_view_storage();
+
+    let native_height = finalized_storage
+        .get_last_pruned_l2_height()
+        .unwrap()
+        .expect("Last pruned L2 height should be set");
+    let ledger_height = ledger_db
+        .get_last_pruned_l2_height()
+        .unwrap()
+        .expect("Last pruned L2 height should be set");
+
+    assert_eq!(native_height, 5);
+    assert_eq!(ledger_height, 5);
+}
+
+#[test]
+pub fn test_pruning_should_prune() {
+    let criteria = DistanceCriteria { distance: 1000 };
+    assert_eq!(criteria.should_prune(0, 1000), None);
+    assert_eq!(criteria.should_prune(0, 1999), None);
+    assert_eq!(criteria.should_prune(0, 2000), Some(1000));
+
+    assert_eq!(criteria.should_prune(1000, 2500), None);
+    assert_eq!(criteria.should_prune(1000, 2999), None);
+    assert_eq!(criteria.should_prune(1000, 3000), Some(2000));
+}
+
+#[test]
+pub fn test_pruning_ledger_db_l2_blocks() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap().inner();
+
+    for i in 1u64..=20 {
+        let l2_block = StoredL2Block {
+            height: i,
+
+            hash: [i as u8; 32],
+            prev_hash: [(i as u8) - 1; 32],
+            txs: vec![StoredTransaction {
+                hash: [i as u8; 32],
+                body: Some(vec![i as u8; 100]), // 100 bytes per tx
+            }],
+
+            state_root: [i as u8; 32],
+            signature: vec![],
+            tx_merkle_root: [0; 32],
+            l1_fee_rate: 0,
+            timestamp: i,
+        };
+
+        ledger_db
+            .put::<L2BlockByNumber>(&L2BlockNumber(i), &l2_block)
+            .unwrap();
+        ledger_db
+            .put::<L2BlockByHash>(&[i as u8; 32], &L2BlockNumber(i))
+            .unwrap();
+        ledger_db
+            .put::<L2Witness>(&L2BlockNumber(i), &(vec![5; 32], vec![6; 32]))
+            .unwrap();
+        ledger_db
+            .put::<ProverStateDiffs>(&L2BlockNumber(i), &vec![])
+            .unwrap();
+    }
+
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db.get::<L2BlockByHash>(&[1; 32]).unwrap().is_some());
+    assert!(ledger_db.get::<L2BlockByHash>(&[10; 32]).unwrap().is_some());
+    assert!(ledger_db.get::<L2BlockByHash>(&[20; 32]).unwrap().is_some());
+
+    prune_ledger_db(NodeType::Sequencer, ledger_db.clone(), 10, None).unwrap();
+
+    let block_1 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(1))
+        .unwrap()
+        .expect("Block header should be retained");
+
+    assert_eq!(
+        block_1.txs.len(),
+        1,
+        "Transaction count should be preserved"
+    );
+    assert!(
+        block_1.txs[0].body.is_none(),
+        "Transaction body should be pruned"
+    );
+    assert_eq!(
+        block_1.txs[0].hash, [1u8; 32],
+        "Transaction hash should be retained"
+    );
+
+    assert_eq!(block_1.height, 1);
+    assert_eq!(block_1.hash, [1u8; 32]);
+
+    assert!(
+        ledger_db.get::<L2BlockByHash>(&[1; 32]).unwrap().is_some(),
+        "Block hash mapping should be retained"
+    );
+
+    let block_10 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(10))
+        .unwrap()
+        .expect("Block header should be retained");
+    assert!(
+        block_10.txs[0].body.is_none(),
+        "Transaction body should be pruned"
+    );
+    assert_eq!(block_10.height, 10);
+    assert!(
+        ledger_db.get::<L2BlockByHash>(&[10; 32]).unwrap().is_some(),
+        "Block hash mapping should be retained"
+    );
+
+    // NOT pruned
+    let block_20 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(20))
+        .unwrap()
+        .expect("Non-pruned block should exist");
+
+    assert_eq!(block_20.txs.len(), 1);
+    assert!(
+        block_20.txs[0].body.is_some(),
+        "Non-pruned block should have tx body"
+    );
+    assert!(ledger_db.get::<L2BlockByHash>(&[20; 32]).unwrap().is_some());
+}
+
+#[test]
+pub fn test_pruning_ledger_db_batch_prover_l2_blocks() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap().inner();
+
+    for i in 1u64..=20 {
+        let l2_block = StoredL2Block {
+            height: i,
+
+            hash: [i as u8; 32],
+            prev_hash: [(i as u8) - 1; 32],
+            txs: vec![StoredTransaction {
+                hash: [i as u8; 32],
+                body: Some(vec![i as u8; 100]), // 100 bytes per tx
+            }],
+
+            state_root: [i as u8; 32],
+            signature: vec![],
+            tx_merkle_root: [0; 32],
+            l1_fee_rate: 0,
+            timestamp: i,
+        };
+
+        ledger_db
+            .put::<L2BlockByNumber>(&L2BlockNumber(i), &l2_block)
+            .unwrap();
+        ledger_db
+            .put::<L2Witness>(&L2BlockNumber(i), &(vec![5; 32], vec![6; 32]))
+            .unwrap();
+        ledger_db
+            .put::<ProverStateDiffs>(&L2BlockNumber(i), &vec![])
+            .unwrap();
+    }
+
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2Witness>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(1))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+
+    prune_ledger_db(NodeType::BatchProver, ledger_db.clone(), 10, None).unwrap();
+
+    let block_1 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(1))
+        .unwrap()
+        .expect("Block header should be retained");
+
+    assert_eq!(
+        block_1.txs.len(),
+        1,
+        "Transaction count should be preserved"
+    );
+    assert!(
+        block_1.txs[0].body.is_none(),
+        "Transaction body should be pruned"
+    );
+    assert_eq!(
+        block_1.txs[0].hash, [1u8; 32],
+        "Transaction hash should be retained"
+    );
+
+    assert_eq!(block_1.height, 1);
+    assert_eq!(block_1.hash, [1u8; 32]);
+
+    let block_10 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(10))
+        .unwrap()
+        .expect("Block header should be retained");
+    assert!(
+        block_10.txs[0].body.is_none(),
+        "Transaction body should be pruned"
+    );
+    assert_eq!(block_10.height, 10);
+
+    // NOT pruned
+    let block_20 = ledger_db
+        .get::<L2BlockByNumber>(&L2BlockNumber(20))
+        .unwrap()
+        .expect("Non-pruned block should exist");
+    assert_eq!(block_20.txs.len(), 1);
+    assert!(
+        block_20.txs[0].body.is_some(),
+        "Non-pruned block should have tx body"
+    );
+
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(1))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProverStateDiffs>(&L2BlockNumber(20))
+        .unwrap()
+        .is_some());
+}
+
+fn prepare_slots_data(ledger_db: &DB) {
+    for da_slot_height in 2u64..=20 {
+        ledger_db
+            .put::<L2RangeByL1Height>(
+                &SlotNumber(da_slot_height),
+                &(
+                    L2BlockNumber(da_slot_height - 1),
+                    L2BlockNumber(da_slot_height),
+                ),
+            )
+            .unwrap();
+        ledger_db
+            .put::<CommitmentsByNumber>(&SlotNumber(da_slot_height), &vec![])
+            .unwrap();
+        ledger_db
+            .put::<ProofsBySlotNumber>(&SlotNumber(da_slot_height), &vec![])
+            .unwrap();
+        ledger_db
+            .put::<ProofsBySlotNumberV2>(&SlotNumber(da_slot_height), &vec![])
+            .unwrap();
+        ledger_db
+            .put::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(da_slot_height), &vec![])
+            .unwrap();
+        ledger_db
+            .put::<LightClientProofBySlotNumber>(
+                &SlotNumber(da_slot_height),
+                &StoredLightClientProof {
+                    proof: vec![1; 32],
+                    light_client_proof_output: StoredLightClientProofOutput {
+                        l2_state_root: [0u8; 32],
+                        light_client_proof_method_id: [1u32; 8],
+                        latest_da_state: StoredLatestDaState {
+                            block_hash: [0; 32],
+                            block_height: da_slot_height,
+                            total_work: [0; 32],
+                            current_target_bits: 0,
+                            epoch_start_time: 0,
+                            prev_11_timestamps: [0; 11],
+                        },
+                        last_l2_height: da_slot_height,
+                        lcp_state_root: [0; 32],
+                        last_sequencer_commitment_index: 1,
+                    },
+                },
+            )
+            .unwrap();
+        ledger_db
+            .put::<SlotByHash>(&[da_slot_height as u8; 32], &SlotNumber(da_slot_height))
+            .unwrap();
+    }
+
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+pub fn test_pruning_ledger_db_fullnode_slots() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap().inner();
+
+    prepare_slots_data(&ledger_db);
+
+    prune_ledger_db(NodeType::FullNode, ledger_db.clone(), 10, None).unwrap();
+
+    // SHOULD NOT CHANGE
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    // SHOULD BE PRUNED UP TO 10
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+pub fn test_pruning_ledger_db_light_client_slots() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap().inner();
+
+    prepare_slots_data(&ledger_db);
+
+    prune_ledger_db(NodeType::LightClientProver, ledger_db.clone(), 10, None).unwrap();
+
+    // SHOULD NOT CHANGE
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    // SHOULD BE PRUNED UP TO 10
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+pub fn test_pruning_ledger_db_batch_prover_slots() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+    let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap().inner();
+
+    prepare_slots_data(&ledger_db);
+
+    prune_ledger_db(NodeType::BatchProver, ledger_db.clone(), 10, None).unwrap();
+
+    // SHOULD NOT CHANGE
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<LightClientProofBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_some());
+    assert!(ledger_db
+        .get::<VerifiedBatchProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    // SHOULD BE PRUNED UP TO 10
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<L2RangeByL1Height>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<CommitmentsByNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumber>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(2))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(10))
+        .unwrap()
+        .is_none());
+    assert!(ledger_db
+        .get::<ProofsBySlotNumberV2>(&SlotNumber(20))
+        .unwrap()
+        .is_some());
+}
+
+fn prepare_state_data(state_db: &StateDB) {
+    let tree = jmt::Sha256Jmt::new(state_db);
+    let key_hash = KeyHash([9u8; 32]);
+    let key_preimage = b"state-key".to_vec();
+
+    state_db
+        .put_preimages(vec![(key_hash, key_preimage.as_slice())])
+        .unwrap();
+
+    for version in 0u64..=20 {
+        let (_, tree_update) = tree
+            .put_value_set([(key_hash, Some(vec![version as u8; 4]))], version)
+            .unwrap();
+
+        state_db.write_node_batch(&tree_update.node_batch).unwrap();
+        state_db
+            .set_stale_nodes(&tree_update.stale_node_index_batch)
+            .unwrap();
+    }
+}
+
+#[test]
+pub fn test_pruning_state_db() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+
+    let state_db = Arc::new(StateDB::setup_schema_db(&rocksdb_config).unwrap());
+    let state_writer = StateDB::new(state_db.clone());
+    let key_preimage = b"state-key".to_vec();
+
+    prepare_state_data(&state_writer);
+    state_db
+        .write_schemas(state_writer.freeze().unwrap())
+        .unwrap();
+
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 1))
+        .unwrap()
+        .is_some());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 10))
+        .unwrap()
+        .is_some());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 11))
+        .unwrap()
+        .is_some());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 20))
+        .unwrap()
+        .is_some());
+
+    prune_state_db(state_db.clone(), 10, None).unwrap();
+
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 1))
+        .unwrap()
+        .is_some());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 10))
+        .unwrap()
+        .is_none());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 11))
+        .unwrap()
+        .is_some());
+    assert!(state_db
+        .get::<JmtValues>(&(key_preimage.clone(), 20))
+        .unwrap()
+        .is_some());
+}
+
+fn prepare_native_data(native_db: &NativeDB) {
+    for version in 1u64..=20 {
+        native_db
+            .set_values(
+                [(b"E/c/some-bytecode".to_vec(), Some(vec![version as u8]))],
+                version,
+            )
+            .unwrap();
+    }
+
+    for block in 1u64..=20 {
+        let version = block + 1;
+        native_db
+            .set_values(
+                [(format!("E/blocks/e{block}").into_bytes(), Some(vec![1u8]))],
+                version,
+            )
+            .unwrap();
+        native_db
+            .set_values(
+                [(format!("E/receipts/e{block}").into_bytes(), Some(vec![1u8]))],
+                version,
+            )
+            .unwrap();
+        native_db
+            .set_values(
+                [(
+                    format!("E/transactions/e{block}").into_bytes(),
+                    Some(vec![1u8]),
+                )],
+                version,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+pub fn test_pruning_native_db() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let rocksdb_config = RocksdbConfig::new(tmpdir.path(), None, None);
+
+    let native_db = Arc::new(NativeDB::setup_schema_db(&rocksdb_config).unwrap());
+    let native_writer = NativeDB::new(native_db.clone());
+
+    let code_key = b"E/c/some-bytecode".to_vec();
+    let block_key_1 = b"E/blocks/e1".to_vec();
+    let block_key_10 = b"E/blocks/e10".to_vec();
+    let block_key_11 = b"E/blocks/e11".to_vec();
+    let receipt_key_10 = b"E/receipts/e10".to_vec();
+    let tx_key_10 = b"E/transactions/e10".to_vec();
+
+    prepare_native_data(&native_writer);
+    native_db
+        .write_schemas(native_writer.freeze().unwrap())
+        .unwrap();
+
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_1.clone(), 2))
+        .unwrap()
+        .is_some());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_10.clone(), 11))
+        .unwrap()
+        .is_some());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_11.clone(), 12))
+        .unwrap()
+        .is_some());
+
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(receipt_key_10.clone(), 11))
+        .unwrap()
+        .is_some());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(tx_key_10.clone(), 11))
+        .unwrap()
+        .is_some());
+
+    prune_native_db(native_db.clone(), 10, None).unwrap();
+
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_1.clone(), 2))
+        .unwrap()
+        .is_none());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_10.clone(), 11))
+        .unwrap()
+        .is_none());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(block_key_11.clone(), 12))
+        .unwrap()
+        .is_some());
+
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(receipt_key_10.clone(), 11))
+        .unwrap()
+        .is_none());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(tx_key_10.clone(), 11))
+        .unwrap()
+        .is_none());
+
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(code_key.clone(), 1))
+        .unwrap()
+        .is_some());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(code_key.clone(), 10))
+        .unwrap()
+        .is_some());
+    assert!(native_db
+        .get::<ModuleAccessoryState>(&(code_key.clone(), 20))
+        .unwrap()
+        .is_some());
+}

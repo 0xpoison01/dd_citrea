@@ -1,0 +1,131 @@
+#![deny(missing_docs)]
+#![doc = include_str!("../README.md")]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use citrea_common::backup::BackupManager;
+use citrea_common::sp1::SP1HostConfig;
+use citrea_common::{FullNodeConfig, NodeType, ProverGuestRunConfig, RpcConfig};
+use citrea_stf::runtime::CitreaRuntime;
+use prover_services::ParallelProverService;
+use reth_tasks::TaskExecutor;
+use sov_db::ledger_db::LedgerDB;
+use sov_db::rocks_db_config::RocksdbConfig;
+use sov_modules_api::default_context::DefaultContext;
+use sov_modules_api::DaSpec;
+use sov_modules_stf_blueprint::{GenesisParams, Runtime as RuntimeTrait};
+use sov_prover_storage_manager::{ProverStorage, ProverStorageManager};
+use sov_rollup_interface::da::DaVerifier;
+use sov_rollup_interface::services::da::DaService;
+use sov_rollup_interface::spec::SpecId;
+use sov_rollup_interface::zk::{Zkvm, ZkvmHost};
+use sov_rollup_interface::Network;
+
+/// This trait defines how to crate all the necessary dependencies required by a rollup.
+#[async_trait]
+pub trait RollupBlueprint: Sized + Send + Sync {
+    /// Data Availability service.
+    type DaService: DaService<Spec = Self::DaSpec> + Send + Sync;
+
+    /// A specification for the types used by a DA layer.
+    type DaSpec: DaSpec + Send + Sync;
+
+    /// Data Availability config.
+    type DaConfig: Send + Sync;
+
+    /// Data Availability verifier.
+    type DaVerifier: DaVerifier + Send + Sync;
+
+    /// Host of a zkVM program.
+    type Vm: ZkvmHost + Zkvm + Send + Sync + 'static;
+
+    /// Creates a new instance of the blueprint.
+    fn new(network: Network) -> Self;
+
+    /// Get batch proof guest code elfs by fork.
+    fn get_batch_proof_elfs(&self) -> HashMap<SpecId, Vec<u8>>;
+
+    /// Get light client guest code elfs by fork.
+    fn get_light_client_elfs(&self) -> HashMap<SpecId, Vec<u8>>;
+
+    /// Get batch prover code commitments by fork.
+    fn get_batch_proof_code_commitments(
+        &self,
+    ) -> HashMap<SpecId, <Self::Vm as Zkvm>::CodeCommitment>;
+
+    /// Get light client prover code commitment.
+    fn get_light_client_proof_code_commitments(
+        &self,
+    ) -> HashMap<SpecId, <Self::Vm as Zkvm>::CodeCommitment>;
+
+    /// Creates RPC methods for the rollup.
+    fn create_rpc_methods(
+        &self,
+        node_type: NodeType,
+        storage: ProverStorage,
+        ledger_db: &LedgerDB,
+        da_service: &Arc<Self::DaService>,
+        backup_manager: &Arc<BackupManager>,
+        rpc_config: RpcConfig,
+    ) -> Result<jsonrpsee::RpcModule<()>, anyhow::Error>;
+
+    /// Creates GenesisConfig from genesis files.
+    #[allow(clippy::type_complexity)]
+    fn create_genesis_config(
+        &self,
+        rt_genesis_paths: &<CitreaRuntime<DefaultContext, Self::DaSpec> as RuntimeTrait<
+            DefaultContext,
+            Self::DaSpec,
+        >>::GenesisPaths,
+        _rollup_config: &FullNodeConfig<Self::DaConfig>,
+    ) -> anyhow::Result<
+        GenesisParams<
+            <CitreaRuntime<DefaultContext, Self::DaSpec> as RuntimeTrait<
+                DefaultContext,
+                Self::DaSpec,
+            >>::GenesisConfig,
+        >,
+    > {
+        let rt_genesis = <CitreaRuntime<DefaultContext, Self::DaSpec> as RuntimeTrait<
+            DefaultContext,
+            Self::DaSpec,
+        >>::genesis_config(rt_genesis_paths)?;
+
+        Ok(GenesisParams {
+            runtime: rt_genesis,
+        })
+    }
+
+    /// Creates instance of [`DaService`].
+    async fn create_da_service(
+        &self,
+        rollup_config: &FullNodeConfig<Self::DaConfig>,
+        require_wallet_check: bool,
+        task_manager: TaskExecutor,
+        network: Network,
+    ) -> Result<Arc<Self::DaService>, anyhow::Error>;
+
+    /// Creates instance of [`ProverService`].
+    async fn create_prover_service(
+        &self,
+        proving_mode: ProverGuestRunConfig,
+        sp1_host_config: SP1HostConfig,
+        da_service: &Arc<Self::DaService>,
+        proof_sampling_number: usize,
+        is_light_client_prover: bool,
+    ) -> ParallelProverService<Self::DaService, Self::Vm>;
+
+    /// Creates instance of [`Self::StorageManager`].
+    /// Panics if initialization fails.
+    fn create_storage_manager(
+        &self,
+        rollup_config: &FullNodeConfig<Self::DaConfig>,
+    ) -> Result<ProverStorageManager, anyhow::Error>;
+
+    /// Creates instance of a LedgerDB.
+    fn create_ledger_db(&self, rocksdb_config: &RocksdbConfig) -> LedgerDB {
+        LedgerDB::with_config(rocksdb_config).expect("Ledger DB failed to open")
+    }
+}

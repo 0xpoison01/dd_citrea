@@ -1,0 +1,43 @@
+[package]
+name = "sov-modules-stf-blueprint"
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Defines a generic state transition function for use with the Sovereign SDK module system"
+
+version = { workspace = true }
+readme = "README.md"
+resolver = "2"
+
+[dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true }
+hex = { workspace = true }
+jmt = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server"], optional = true }
+rs_merkle = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true, optional = true }
+
+# Sovereign-SDK deps
+sov-db = { path = "../../full-node/db/sov-db", optional = true }
+sov-modules-api = { path = "../sov-modules-api", default-features = false }
+sov-rollup-interface = { path = "../../rollup-interface" }
+sov-state = { path = "../sov-state" }
+sov-keys = { path = "../sov-keys" }
+
+# Citrea deps
+citrea-primitives = { path = "../../../../crates/primitives" }
+
+[features]
+default = []
+native = [
+  "dep:sov-db",
+  "sov-state/native",
+  "sov-modules-api/native",
+  "sov-rollup-interface/native",
+  "dep:tracing",
+  "jsonrpsee",
+]

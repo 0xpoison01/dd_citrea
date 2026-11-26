@@ -1,0 +1,787 @@
+/// Testing specific features of the sequencer
+use std::str::FromStr;
+use std::time::Duration;
+
+use alloy::consensus::{Signed, TxEip1559, TxEnvelope};
+use alloy_primitives::{Address, U256};
+use alloy_rlp::{BytesMut, Encodable};
+use alloy_rpc_types::BlockNumberOrTag;
+use citrea_common::{SequencerConfig, SequencerMempoolConfig};
+use citrea_evm::system_contracts::BitcoinLightClient;
+use citrea_evm::BITCOIN_LIGHT_CLIENT_CONTRACT_ADDRESS;
+use citrea_sequencer::MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK;
+use citrea_stf::genesis_config::GenesisPaths;
+use sov_mock_da::{MockAddress, MockDaService};
+use sov_rollup_interface::services::da::DaService;
+use tokio::time::sleep;
+
+use super::evm::init_test_rollup;
+use super::{initialize_test, TestConfig};
+use crate::common::helpers::{
+    create_default_rollup_config, start_rollup, tempdir_with_children, wait_for_commitment,
+    wait_for_l1_block, wait_for_l2_block, NodeMode,
+};
+use crate::common::{make_test_client, TEST_DATA_GENESIS_PATH};
+
+/// Run the sequencer.
+/// Create some blocks.
+/// Create more than one da blocks consecutively.
+/// Check if the sequencer fills the missing DA blocks (don't skip any DA block. create an empty L2 block if needed)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sequencer_fill_missing_da_blocks() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 1000,
+        da_update_interval_ms: 500,
+        block_production_interval_ms: 500,
+        ..Default::default()
+    };
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = init_test_rollup(seq_port).await;
+
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&seq_test_client, 1, None).await;
+
+    let da_service = MockDaService::new(MockAddress::from([0; 32]), &da_db_dir);
+
+    let to_be_filled_da_block_count = 25;
+    let latest_da_block = 1 + to_be_filled_da_block_count;
+    // publish da blocks back to back
+    for _ in 0..to_be_filled_da_block_count {
+        da_service.publish_test_block().await.unwrap();
+    }
+    wait_for_l1_block(&da_service, latest_da_block, None).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // publish a block which will start filling of all missing da blocks in one l2 block
+    // since this test runs on tangerine instead of generating one block pre missed da block
+    // It will generate one l2 block for every missed 10 da block
+    // We are testing for 25 missed da blocks one of them will go to the last l2 block
+    // So we will have 24 missed block count
+    // 10 + 10 + 4 This will generate 3 blocks, these blocks 2,3,4 will have 10, 10, 4 system transactions (set block info) respectively
+    // and the last block will have 1 system transaction (set block info)
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&seq_test_client, 2, None).await;
+
+    let first_filler_l2_block = 2;
+    let last_filler_l2_block = first_filler_l2_block
+        + (to_be_filled_da_block_count - 1).div_ceil(MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK)
+        - 1;
+    // wait for all corresponding da blocks to be filled by sequencer
+    wait_for_l2_block(&seq_test_client, last_filler_l2_block, None).await;
+
+    let mut next_da_block = 2;
+
+    // ensure that all the system transactions are set correctly
+    for filler_l2_block in first_filler_l2_block..=last_filler_l2_block {
+        let block = seq_test_client
+            .eth_get_block_by_number(Some(filler_l2_block.into()))
+            .await;
+
+        if filler_l2_block == last_filler_l2_block {
+            for _ in 0..(to_be_filled_da_block_count - 1) % MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK {
+                let block = da_service.get_block_at(next_da_block).await.unwrap();
+                let res: String = seq_test_client
+                    .contract_call(
+                        BITCOIN_LIGHT_CLIENT_CONTRACT_ADDRESS,
+                        BitcoinLightClient::get_block_hash(next_da_block).to_vec(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    block.header.hash.0.to_vec(),
+                    hex::decode(&res[2..]).unwrap()
+                );
+                next_da_block += 1;
+            }
+            assert_eq!(
+                block.transactions.len() as u64,
+                (to_be_filled_da_block_count - 1) % MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK
+            );
+        } else {
+            for _ in 0..MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK {
+                let block = da_service.get_block_at(next_da_block).await.unwrap();
+                let res: String = seq_test_client
+                    .contract_call(
+                        BITCOIN_LIGHT_CLIENT_CONTRACT_ADDRESS,
+                        BitcoinLightClient::get_block_hash(next_da_block).to_vec(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    block.header.hash.0.to_vec(),
+                    hex::decode(&res[2..]).unwrap()
+                );
+                next_da_block += 1;
+            }
+            assert_eq!(
+                block.transactions.len() as u64,
+                MAX_MISSED_DA_BLOCKS_PER_L2_BLOCK
+            );
+        }
+    }
+
+    // publish an extra l2 block
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&seq_test_client, last_filler_l2_block + 1, None).await;
+
+    // Wait for storage
+    sleep(Duration::from_secs(1)).await;
+
+    let head_l2_block_num = seq_test_client
+        .ledger_get_head_l2_block_height()
+        .await
+        .unwrap();
+    assert_eq!(head_l2_block_num, last_filler_l2_block + 2);
+
+    seq_task.graceful_shutdown();
+    Ok(())
+}
+
+/// Run the sequencer.
+/// Send spam transactions.
+/// Check if the sequencer triggers a commitment after a certain state diff size since it's last commitment.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sequencer_commitment_threshold() {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let da_service = MockDaService::new(MockAddress::from([0; 32]), &da_db_dir);
+
+    // Put a large number for commitment threshold
+    let max_l2_blocks_per_commitment = 1_000_000;
+
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment,
+        mempool_conf: SequencerMempoolConfig {
+            max_account_slots: 4000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+
+    let seq_test_client = init_test_rollup(seq_port).await;
+
+    seq_test_client.send_publish_batch_request().await;
+
+    for i in 1..35 {
+        for _ in 0..60 {
+            let address = Address::random();
+            let _pending = seq_test_client
+                .send_eth(address, None, None, None, 1u128)
+                .await
+                .unwrap();
+        }
+        // give time for mempool to be filled
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        seq_test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&seq_test_client, i, None).await;
+    }
+
+    wait_for_l2_block(&seq_test_client, 35, Some(Duration::from_secs(60))).await;
+
+    // After block 35, the state diff should be large enough to trigger a commitment.
+    let commitments = wait_for_commitment(&da_service, 2, Some(Duration::from_secs(60))).await;
+    assert_eq!(commitments.len(), 1);
+
+    for i in 35..70 {
+        for _ in 0..60 {
+            let address = Address::random();
+            let _pending = seq_test_client
+                .send_eth(address, None, None, None, 1u128)
+                .await
+                .unwrap();
+        }
+        // give time for mempool to be filled
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        seq_test_client.send_publish_batch_request().await;
+        wait_for_l2_block(&seq_test_client, i, None).await;
+    }
+
+    wait_for_l2_block(&seq_test_client, 70, Some(Duration::from_secs(60))).await;
+
+    // After block 70, the state diff should be large enough to trigger a commitment.
+    // But the remaining blocks state diff should NOT trigger a third.
+    let commitments = wait_for_commitment(&da_service, 3, Some(Duration::from_secs(60))).await;
+    assert_eq!(commitments.len(), 1);
+
+    seq_task.graceful_shutdown();
+}
+
+/// Run the sequencer.
+/// Mempool admission prices the L1 fee against the latest sealed block's L1 fee rate, and the
+/// genesis block carries a rate of 0 — so at genesis state a transaction whose balance covers
+/// exactly its L2 cost is admitted with no L1 fee reserved. Block 1 is then produced with the
+/// real, non-zero DA fee rate: the dry run fails the transaction on the L1 fee, removes it from
+/// the mempool and leaves it out of the block.
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_failing_on_l1_is_removed_from_mempool() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+    let fullnode_db_dir = storage_dir.path().join("full-node").to_path_buf();
+
+    let (seq_test_client, full_node_test_client, seq_task, full_node_task, _) =
+        initialize_test(TestConfig {
+            da_path: da_db_dir.clone(),
+            sequencer_path: sequencer_db_dir.clone(),
+            fullnode_path: fullnode_db_dir.clone(),
+            ..Default::default()
+        })
+        .await;
+
+    // Base fee block 1 will be priced at.
+    let first_block_base_fee = seq_test_client
+        .eth_get_block_by_number_with_detail(Some(BlockNumberOrTag::Pending))
+        .await
+        .header
+        .base_fee_per_gas
+        .unwrap() as u128;
+
+    let balance = seq_test_client
+        .eth_get_balance(seq_test_client.from_addr, None)
+        .await
+        .unwrap();
+
+    // Size the transfer so the sender's balance covers exactly the L2 cost
+    // (gas * base fee + value), leaving nothing for any positive L1 fee.
+    let value = u128::try_from(balance - U256::from(21000 * first_block_base_fee)).unwrap();
+
+    let tx = seq_test_client
+        .send_eth_with_gas(
+            Address::from_str("0x0000000000000000000000000000000000000000").unwrap(),
+            Some(0),
+            Some(first_block_base_fee),
+            21000,
+            value,
+        )
+        .await
+        .unwrap();
+
+    let tx_from_mempool = seq_test_client
+        .eth_get_transaction_by_hash(*tx.tx_hash(), Some(true))
+        .await;
+
+    assert!(tx_from_mempool.is_some());
+
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&seq_test_client, 1, None).await;
+
+    let block = seq_test_client
+        .eth_get_block_by_number_with_detail(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    // The block was priced at the base fee the transaction's funds were sized against, so the
+    // only cost it could not cover is the L1 fee.
+    assert_eq!(
+        block.header.base_fee_per_gas.unwrap() as u128,
+        first_block_base_fee
+    );
+
+    let tx_from_mempool = seq_test_client
+        .eth_get_transaction_by_hash(*tx.tx_hash(), Some(true))
+        .await;
+
+    let l2_block = seq_test_client
+        .ledger_get_l2_block_by_number(block.header.number)
+        .await
+        .unwrap();
+
+    // Block 1 carries only its system transactions; the L1-fee-failing transaction was dropped
+    // from the mempool without being included.
+    assert!(!block
+        .transactions
+        .hashes()
+        .any(|hash| hash == *tx.tx_hash()));
+    assert!(tx_from_mempool.is_none());
+    // All of a block's EVM transactions are bundled into a single sov-tx, so the ledger block
+    // carries exactly one: the system-transaction bundle.
+    assert_eq!(l2_block.txs.len(), 1);
+
+    wait_for_l2_block(&full_node_test_client, block.header.number, None).await;
+
+    let block_from_full_node = full_node_test_client
+        .eth_get_block_by_number_with_detail(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    assert_eq!(block_from_full_node, block);
+
+    seq_task.graceful_shutdown();
+    full_node_task.graceful_shutdown();
+
+    Ok(())
+}
+
+/// Transactions with a high gas limit should be accounted for by using
+/// their actual cumulative gas consumption to prevent them from reserving
+/// whole blocks on their own.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_gas_limit_too_high() {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let db_dir: tempfile::TempDir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = db_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = db_dir.path().join("sequencer").to_path_buf();
+    let full_node_db_dir = db_dir.path().join("full-node").to_path_buf();
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let target_gas_limit: u64 = 30_000_000;
+    let transfer_gas_limit = 21_000;
+    let system_txs_gas_used = 369045;
+    let tx_count = (target_gas_limit - system_txs_gas_used).div_ceil(transfer_gas_limit);
+    let addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+
+    // Increase max account slots to not stuck as spammer
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 1000,
+        deposit_mempool_fetch_limit: 100,
+        mempool_conf: SequencerMempoolConfig {
+            max_account_slots: tx_count * 2,
+            ..Default::default()
+        },
+        da_update_interval_ms: 1000,
+        block_production_interval_ms: 1000,
+        // This test fills a whole 30M-gas block with ~1400 transfers; give the dry run enough
+        // time so the gas limit — not the time budget — decides the block's contents.
+        dry_run_time_limit_ms: 60_000,
+        ..Default::default()
+    };
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = make_test_client(seq_port).await.unwrap();
+
+    let (full_node_port_tx, full_node_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &full_node_db_dir,
+        &da_db_dir,
+        NodeMode::FullNode(seq_port),
+        None,
+    );
+    let full_node_task = start_rollup(
+        full_node_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        None,
+        None,
+        false,
+    )
+    .await;
+
+    let full_node_port = full_node_port_rx.await.unwrap();
+    let full_node_test_client = make_test_client(full_node_port).await.unwrap();
+
+    let mut tx_hashes = vec![];
+    // Loop until tx_count.
+    // This means that we are going to have 5 transactions which have not been included.
+    for _ in 0..tx_count + 4 {
+        let tx_hash = seq_test_client
+            .send_eth_with_gas(addr, None, None, 10_000_000, 0u128)
+            .await
+            .unwrap();
+        tx_hashes.push(tx_hash);
+    }
+
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&full_node_test_client, 1, Some(Duration::from_secs(60))).await;
+
+    let block = full_node_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    let block_transactions = block.transactions.as_hashes().unwrap();
+    // assert the block contains all txs apart from the last 5
+    for tx_hash in tx_hashes[0..tx_hashes.len() - 5].iter() {
+        assert!(block_transactions.contains(tx_hash.tx_hash()));
+    }
+    for tx_hash in tx_hashes[tx_hashes.len() - 5..].iter() {
+        assert!(!block_transactions.contains(tx_hash.tx_hash()));
+    }
+
+    let block_from_sequencer = seq_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    assert_eq!(
+        block_from_sequencer.header.state_root,
+        block.header.state_root
+    );
+    assert_eq!(block_from_sequencer.header.hash, block.header.hash);
+
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&full_node_test_client, 2, Some(Duration::from_secs(60))).await;
+
+    let block = full_node_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    let block_from_sequencer = seq_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Latest))
+        .await;
+
+    assert!(!block.transactions.is_empty());
+    assert_eq!(
+        block_from_sequencer.header.state_root,
+        block.header.state_root
+    );
+    assert_eq!(block_from_sequencer.header.hash, block.header.hash);
+
+    seq_task.graceful_shutdown();
+    full_node_task.graceful_shutdown();
+}
+
+/// Run the sequencer.
+/// Fill the mempool with transactions.
+/// Create a block with a system transaction.
+/// Check if the sequencer selects the correct amount of transactions to fill the
+/// gas limit left from the system transaction(s).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_system_tx_effect_on_block_gas_limit() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::INFO);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer", "full-node"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let da_service = MockDaService::new(MockAddress::default(), &da_db_dir.clone());
+
+    // start rollup on da block 3
+    for _ in 0..3 {
+        da_service.publish_test_block().await.unwrap();
+    }
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 1000,
+        mempool_conf: SequencerMempoolConfig {
+            max_account_slots: 100,
+            ..Default::default()
+        },
+        da_update_interval_ms: 1000,
+        block_production_interval_ms: 500,
+        ..Default::default()
+    };
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir("../../resources/test-data/integration-tests-low-block-gas-limit"),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = make_test_client(seq_port).await?;
+    // sys tx use L1BlockHash(50737 + 80626 + 21770) + Bridge(215912) = 369045 gas
+    // the block gas limit is 1_500_000 because the system txs gas limit is 1_500_000 (decided with @eyusufatik and @okkothejawa as bridge init takes 1M gas)
+    // 1500000 - 369045 = 1_130_955 gas left in block
+    // 1_130_955 / 21000 =~ 53.85... so 53 ether transfer transactions can be included in the block
+
+    // send 53 ether transfer transactions
+    let addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
+    for _ in 0..52 {
+        let _pending = seq_test_client
+            .send_eth(addr, None, None, None, 0u128)
+            .await
+            .unwrap();
+    }
+
+    // 53rd tx should be the last tx in the l2 block
+    let last_in_tx = seq_test_client
+        .send_eth(addr, None, None, None, 0u128)
+        .await;
+
+    // 54th tx should not be in l2 block
+    let not_in_tx = seq_test_client
+        .send_eth(addr, None, None, None, 0u128)
+        .await;
+
+    seq_test_client.send_publish_batch_request().await;
+
+    da_service.publish_test_block().await.unwrap();
+
+    let last_in_receipt = last_in_tx.unwrap().get_receipt().await.unwrap();
+
+    wait_for_l2_block(&seq_test_client, 1, None).await;
+    // Wait for storage
+    sleep(Duration::from_secs(1)).await;
+
+    let initial_l2_block = seq_test_client
+        .ledger_get_l2_block_by_number(1)
+        .await
+        .unwrap();
+
+    let last_tx_hash = last_in_receipt.transaction_hash;
+    let last_tx = seq_test_client
+        .eth_get_transaction_by_hash(last_tx_hash, Some(false))
+        .await
+        .unwrap();
+    let signed_tx = Signed::<TxEip1559>::try_from(last_tx).unwrap();
+    let envelope = TxEnvelope::Eip1559(signed_tx);
+    let mut last_tx_raw = BytesMut::new();
+    envelope.encode(&mut last_tx_raw);
+
+    assert!(last_in_receipt.block_number.is_some());
+
+    // last in tx byte array should be a subarray of txs[0]
+    assert!(find_subarray(
+        initial_l2_block.clone().txs[0].tx.as_slice(),
+        &last_tx_raw[2..]
+    )
+    .is_some());
+
+    seq_test_client.send_publish_batch_request().await;
+
+    da_service.publish_test_block().await.unwrap();
+
+    let not_in_receipt = not_in_tx.unwrap().get_receipt().await.unwrap();
+
+    let not_in_hash = not_in_receipt.transaction_hash;
+
+    let not_in_tx = seq_test_client
+        .eth_get_transaction_by_hash(not_in_hash, Some(false))
+        .await
+        .unwrap();
+    let signed_tx = Signed::<TxEip1559>::try_from(not_in_tx).unwrap();
+    let envelope = TxEnvelope::Eip1559(signed_tx);
+    let mut not_in_raw = BytesMut::new();
+    envelope.encode(&mut not_in_raw);
+
+    // not in tx byte array should not be a subarray of txs[0]
+    assert!(find_subarray(initial_l2_block.txs[0].tx.as_slice(), &not_in_raw[2..]).is_none());
+
+    seq_test_client.send_publish_batch_request().await;
+
+    let second_l2_block = seq_test_client
+        .ledger_get_l2_block_by_number(2)
+        .await
+        .unwrap();
+
+    // should be in tx byte array of the l2 block after
+    assert!(find_subarray(second_l2_block.txs[0].tx.as_slice(), &not_in_raw[2..]).is_some());
+
+    let block1 = seq_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(1)))
+        .await;
+
+    // the last in tx should be in the block
+    let block1_transactions = block1.transactions.as_hashes().unwrap();
+    assert!(block1_transactions.iter().any(|tx| tx == &last_tx_hash));
+    // and the other tx should not be in
+    assert!(!block1_transactions.iter().any(|tx| tx == &not_in_hash));
+
+    let block2 = seq_test_client
+        .eth_get_block_by_number(Some(BlockNumberOrTag::Number(2)))
+        .await;
+    // the other tx should be in second block
+    let block2_transactions = block2.transactions.as_hashes().unwrap();
+    assert!(block2_transactions.iter().any(|tx| tx == &not_in_hash));
+
+    seq_task.graceful_shutdown();
+
+    Ok(())
+}
+
+fn find_subarray(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Test the halt and resume commitments functionality
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sequencer_halt_resume_commitments() -> Result<(), anyhow::Error> {
+    // citrea::initialize_logging(tracing::Level::DEBUG);
+
+    let storage_dir = tempdir_with_children(&["DA", "sequencer"]);
+    let da_db_dir = storage_dir.path().join("DA").to_path_buf();
+    let sequencer_db_dir = storage_dir.path().join("sequencer").to_path_buf();
+
+    let (seq_port_tx, seq_port_rx) = tokio::sync::oneshot::channel();
+
+    let rollup_config = create_default_rollup_config(
+        true,
+        &sequencer_db_dir,
+        &da_db_dir,
+        NodeMode::SequencerNode,
+        None,
+    );
+
+    let sequencer_config = SequencerConfig {
+        max_l2_blocks_per_commitment: 2, // Small number of commitments for testing
+        da_update_interval_ms: 100,
+        block_production_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let seq_task = start_rollup(
+        seq_port_tx,
+        GenesisPaths::from_dir(TEST_DATA_GENESIS_PATH),
+        None,
+        None,
+        rollup_config,
+        Some(sequencer_config),
+        None,
+        false,
+    )
+    .await;
+
+    let seq_port = seq_port_rx.await.unwrap();
+    let seq_test_client = init_test_rollup(seq_port).await;
+
+    let da_service = MockDaService::new(MockAddress::from([0; 32]), &da_db_dir);
+
+    // Publish initial DA block
+    da_service.publish_test_block().await.unwrap();
+    wait_for_l1_block(&da_service, 2, None).await;
+
+    // Create first 2 L2 blocks to trigger initial commitment
+    seq_test_client.send_publish_batch_request().await;
+    seq_test_client.send_publish_batch_request().await;
+    wait_for_l2_block(&seq_test_client, 2, None).await;
+
+    // Wait for first commitment to be published
+    let initial_commitments =
+        wait_for_commitment(&da_service, 3, Some(Duration::from_secs(30))).await;
+    assert_eq!(
+        initial_commitments.len(),
+        1,
+        "Expected 1 initial commitment"
+    );
+
+    // Halt commitments via RPC
+    seq_test_client.sequencer_halt_commitments().await.unwrap();
+
+    // Wait a bit for the halt signal to be processed
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create more blocks - should not result in commitments while halted
+    for _ in 0..3 {
+        seq_test_client.send_publish_batch_request().await;
+    }
+
+    // Wait for potential commitments (should not happen)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify no new commitments were published while halted
+    // Since the sequencer is halted, no new DA blocks should be published
+    // We should still be at DA block 3
+    let current_da_height = da_service.get_height().await;
+    assert_eq!(
+        current_da_height, 3,
+        "No L1 block should have been produced while halted"
+    );
+
+    // Resume commitments via RPC
+    seq_test_client
+        .sequencer_resume_commitments()
+        .await
+        .unwrap();
+
+    // Wait a bit for the resume signal to be processed
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Wait for commitment to be published after resume
+    let resumed_commitments =
+        wait_for_commitment(&da_service, 5, Some(Duration::from_secs(30))).await;
+    // We should have a single commitment at block 5
+    assert_eq!(resumed_commitments.len(), 1);
+
+    // Verify the commitment is for the correct block range
+    let commitment = &resumed_commitments[0];
+    assert_eq!(commitment.l2_end_block_number, 6);
+
+    seq_task.graceful_shutdown();
+    Ok(())
+}

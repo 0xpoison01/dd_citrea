@@ -1,0 +1,1058 @@
+use std::str::FromStr;
+
+use alloy_consensus::TxReceipt;
+use alloy_primitives::{address, keccak256, Address, Bytes, TxKind};
+use revm::primitives::U256;
+use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
+use sha2::Digest;
+use sov_modules_api::default_context::DefaultContext;
+use sov_modules_api::hooks::HookL2BlockInfo;
+use sov_modules_api::utils::generate_address;
+use sov_modules_api::{Context, Module, StateMapAccessor, StateVecAccessor, WorkingSet};
+use sov_rollup_interface::spec::SpecId as SovSpecId;
+
+use crate::call::CallMessage;
+use crate::smart_contracts::{
+    BlobBaseFeeContract, KZGPointEvaluationCallerContract, McopyContract, P256VerifyCallerContract,
+    SchnorrVerifyCallerContract, SelfDestructorContract, SelfdestructingConstructorContract,
+    SimpleStorageContract, TransientStorageContract,
+};
+use crate::tests::get_test_seq_pub_key;
+use crate::tests::test_signer::TestSigner;
+use crate::tests::utils::{create_contract_message, get_evm, get_evm_config, get_evm_with_spec};
+use crate::{AccountInfo, Evm, RlpEvmTransaction};
+type C = DefaultContext;
+
+use super::call_tests::send_money_to_contract_message;
+use super::utils::create_contract_message_with_bytecode;
+
+const VERSIONED_HASH_VERSION_KZG: u8 = 1;
+
+fn claim_gift_from_transient_storage_contract_transaction(
+    contract_addr: Address,
+    dev_signer: &TestSigner,
+    nonce: u64,
+) -> RlpEvmTransaction {
+    let contract = TransientStorageContract::default();
+    dev_signer
+        .sign_default_transaction(TxKind::Call(contract_addr), contract.claim_gift(), nonce, 0)
+        .unwrap()
+}
+
+fn call_mcopy(contract_addr: Address, dev_signer: &TestSigner, nonce: u64) -> RlpEvmTransaction {
+    let contract = McopyContract::default();
+    dev_signer
+        .sign_default_transaction(TxKind::Call(contract_addr), contract.call_mcopy(), nonce, 0)
+        .unwrap()
+}
+
+fn store_blob_base_fee_transaction(
+    contract_addr: Address,
+    dev_signer: &TestSigner,
+    nonce: u64,
+) -> RlpEvmTransaction {
+    let contract = BlobBaseFeeContract::default();
+    dev_signer
+        .sign_default_transaction(
+            TxKind::Call(contract_addr),
+            contract.store_blob_base_fee(),
+            nonce,
+            0,
+        )
+        .unwrap()
+}
+
+fn call_kzg_point_evaluation_transaction(
+    contract_addr: Address,
+    dev_signer: &TestSigner,
+    nonce: u64,
+    input: Bytes,
+) -> RlpEvmTransaction {
+    let contract = KZGPointEvaluationCallerContract::default();
+    dev_signer
+        .sign_default_transaction(
+            TxKind::Call(contract_addr),
+            contract.call_kzg_point_evaluation(input),
+            nonce,
+            0,
+        )
+        .unwrap()
+}
+
+fn call_p256_verify_transaction(
+    contract_addr: Address,
+    dev_signer: &TestSigner,
+    nonce: u64,
+    input: Bytes,
+) -> RlpEvmTransaction {
+    let contract = P256VerifyCallerContract::default();
+    dev_signer
+        .sign_default_transaction(
+            TxKind::Call(contract_addr),
+            contract.call_p256_verify(input),
+            nonce,
+            0,
+        )
+        .unwrap()
+}
+
+fn call_schnorr_verify_transaction(
+    contract_addr: Address,
+    dev_signer: &TestSigner,
+    nonce: u64,
+    input: Bytes,
+) -> RlpEvmTransaction {
+    let contract = SchnorrVerifyCallerContract::default();
+    dev_signer
+        .sign_default_transaction(
+            TxKind::Call(contract_addr),
+            contract.call_schnorr_verify(input),
+            nonce,
+            0,
+        )
+        .unwrap()
+}
+
+#[test]
+fn test_cancun_transient_storage_works() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::latest());
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    // Deploy transient storage contract
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, TransientStorageContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    // Send money to transient storage contract
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+        let call_tx =
+            send_money_to_contract_message(contract_addr, &dev_signer, 1, 10000000000000000000);
+
+        evm.call(
+            CallMessage { txs: vec![call_tx] },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    // Call claim gift from transient storage contract
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+        let call_tx =
+            claim_gift_from_transient_storage_contract_transaction(contract_addr, &dev_signer, 2);
+
+        evm.call(
+            CallMessage { txs: vec![call_tx] },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    assert!(receipts.last().unwrap().receipt.status());
+}
+
+#[test]
+fn test_cancun_mcopy_works() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::latest());
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message = create_contract_message(&dev_signer, 0, McopyContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+        let call_tx = call_mcopy(contract_addr, &dev_signer, 1);
+
+        evm.call(
+            CallMessage { txs: vec![call_tx] },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    assert!(receipts.last().unwrap().receipt.status());
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap();
+    assert_eq!(storage_value, U256::from(80));
+}
+
+// tests second part (last one) of https://eips.ethereum.org/EIPS/eip-6780
+// First pat is in call_tests.rs `test_self_destruct_restriction`
+#[test]
+fn test_self_destructing_constructor() {
+    let contract_balance: u128 = 1000000000000000;
+
+    // address used in selfdestruct
+    let die_to_address = address!("11115497b157177315e1204f52e588b393111111");
+
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) = get_evm(&config);
+    let l1_fee_rate = 0;
+    let l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+    let contract = SelfdestructingConstructorContract::default();
+
+    let constructed_bytecode = contract.construct(die_to_address);
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let sender_address = generate_address::<C>("sender");
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        // deploy selfdestruct contract
+        let rlp_transactions = vec![create_contract_message_with_bytecode(
+            &dev_signer,
+            0,
+            constructed_bytecode,
+            Some(contract_balance),
+        )];
+
+        evm.call(
+            CallMessage {
+                txs: rlp_transactions,
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let contract_info = evm.account_info(&contract_addr, &mut working_set);
+    // Post-fork behavior: the contract is created and selfdestructed in the same transaction,
+    // so an address that did not exist before the transaction must remain non-existent.
+    assert_eq!(contract_info, None);
+    assert!(!evm.account_exists(&contract_addr, &mut working_set));
+
+    let die_to_contract_info = evm.account_info(&die_to_address, &mut working_set);
+
+    // die_to_address should have the contract balance
+    assert!(die_to_contract_info.is_some());
+
+    assert_eq!(
+        die_to_contract_info.unwrap().balance,
+        U256::from(contract_balance)
+    );
+
+    // storage not saved
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap_or_default();
+
+    assert_eq!(storage_value, U256::ZERO);
+
+    // after destruction codes should also be removed
+    // calculated with
+    // `solc --combined-json bin-runtime SelfdestructingConstructor.sol``
+    let contract_runtime_bytecode_str = "6080604052348015600e575f5ffd5b50600436106026575f3560e01c806386b714e214602a575b5f5ffd5b60306044565b604051603b9190605f565b60405180910390f35b5f5481565b5f819050919050565b6059816049565b82525050565b5f60208201905060705f8301846052565b9291505056fea26469706673582212208484c7bba946ae0413e52acf85e9297accf9e37ca2464f578d3934a5c25edb7b64736f6c63430008210033";
+    let contract_runtime_bytecode = hex::decode(contract_runtime_bytecode_str).unwrap();
+
+    let contract_code_hash = keccak256(contract_runtime_bytecode.as_slice());
+
+    let code = evm
+        .offchain_code
+        .get(&contract_code_hash, &mut working_set.offchain_state());
+    assert!(code.is_none());
+
+    let off_chain_code = evm
+        .offchain_code
+        .get(&contract_code_hash, &mut working_set.offchain_state());
+    assert!(off_chain_code.is_none());
+}
+
+#[test]
+fn test_prefunded_self_destructing_constructor() {
+    let contract_balance: u128 = 1000000000000000;
+
+    // address used in selfdestruct
+    let die_to_address = address!("11115497b157177315e1204f52e588b393111111");
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+    let contract_addr = dev_signer.address().create(1);
+    let (mut evm, mut working_set, _spec_id, _ledger_db) = get_evm(&config);
+    let l1_fee_rate = 0;
+    let l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+    let contract = SelfdestructingConstructorContract::default();
+
+    let constructed_bytecode = contract.construct(die_to_address);
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let sender_address = generate_address::<C>("sender");
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let rlp_transactions = vec![
+            // presend funds
+            send_money_to_contract_message(contract_addr, &dev_signer, 0, contract_balance),
+            // deploy selfdestruct contract
+            create_contract_message_with_bytecode(&dev_signer, 1, constructed_bytecode, None),
+        ];
+
+        evm.call(
+            CallMessage {
+                txs: rlp_transactions,
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    // The prefunding transaction allocated an index before the CREATE transaction. Citrea keeps
+    // that index and clears the account in place rather than deleting it.
+    assert_eq!(
+        evm.account_info(&contract_addr, &mut working_set),
+        Some(AccountInfo::default())
+    );
+    assert!(evm.account_exists(&contract_addr, &mut working_set));
+
+    let die_to_contract_info = evm.account_info(&die_to_address, &mut working_set);
+    // die_to_address should have the contract balance
+    assert!(die_to_contract_info.is_some());
+    assert_eq!(
+        die_to_contract_info.unwrap().balance,
+        U256::from(contract_balance)
+    );
+}
+
+#[test]
+fn test_blob_base_fee_should_return_1() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::latest());
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, BlobBaseFeeContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    for _ in 0..10 {
+        evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+        evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+        evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+        l2_height += 1;
+    }
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+        let call_tx = store_blob_base_fee_transaction(contract_addr, &dev_signer, 1);
+
+        evm.call(
+            CallMessage { txs: vec![call_tx] },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+    // l2_height += 1;
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    assert!(receipts.last().unwrap().receipt.status());
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap();
+
+    assert_eq!(storage_value, U256::from(1));
+}
+
+#[test]
+fn test_kzg_point_eval_should_revert() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) = get_evm(&config);
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, KZGPointEvaluationCallerContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    // Implementation taken from https://eips.ethereum.org/EIPS/eip-4844#point-evaluation-precompile
+    fn kzg_to_versioned_hash(commitment: Bytes) -> Bytes {
+        let mut commitment_hash = sha2::Sha256::digest(commitment).to_vec();
+        commitment_hash[0] = VERSIONED_HASH_VERSION_KZG;
+        Bytes::from(commitment_hash)
+    }
+
+    // data is taken from: https://github.com/ethereum/c-kzg-4844/tree/main/tests/verify_kzg_proof/kzg-mainnet/verify_kzg_proof_case_correct_proof_d0992bc0387790a4
+    let commitment= Bytes::from_str("8f59a8d2a1a625a17f3fea0fe5eb8c896db3764f3185481bc22f91b4aaffcca25f26936857bc3a7c2539ea8ec3a952b7").unwrap();
+    let versioned_hash = kzg_to_versioned_hash(commitment.clone());
+    let z = Bytes::from_str("5eb7004fe57383e6c88b99d839937fddf3f99279353aaf8d5c9a75f91ce33c62")
+        .unwrap();
+    let y = Bytes::from_str("4882cf0609af8c7cd4c256e63a35838c95a9ebbf6122540ab344b42fd66d32e1")
+        .unwrap();
+    let proof =  Bytes::from_str("0x987ea6df69bbe97c23e0dd948cf2d4490824ba7fea5af812721b2393354b0810a9dba2c231ea7ae30f26c412c7ea6e3a").unwrap();
+
+    // The data is encoded as follows: versioned_hash | z | y | commitment | proof | with z and y being padded 32 byte big endian values
+    // ref: https://eips.ethereum.org/EIPS/eip-4844#point-evaluation-precompile
+    let mut input = vec![];
+    input.extend_from_slice(&versioned_hash);
+    input.extend_from_slice(&z);
+    input.extend_from_slice(&y);
+    input.extend_from_slice(&commitment);
+    input.extend_from_slice(&proof);
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message = call_kzg_point_evaluation_transaction(
+            contract_addr,
+            &dev_signer,
+            1,
+            Bytes::from(input),
+        );
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap();
+    assert_ne!(
+        storage_value,
+        // expected if point eval precompile was enabled
+        U256::from_str(
+            "52435875175126190479447740508185965837690552500527637822603658699938581184513"
+        )
+        .unwrap()
+    );
+    assert!(receipts.last().unwrap().receipt.status());
+}
+
+// 1. deploy p256verify contract on fork1 (any fork will work)
+// 2. call p256verify with a valid data after tangerine (it must succeed because p256verify is enabled)
+// this test also shows schnorr verify precompile works only after tangerine, see prague() in handler.rs
+#[test]
+fn test_p256_verify() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::Kumquat);
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let mut l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::Kumquat,
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::Kumquat, l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, P256VerifyCallerContract::default());
+
+        let input = Bytes::from_str("b5a77e7a90aa14e0bf5f337f06f597148676424fae26e175c6e5621c34351955289f319789da424845c9eac935245fcddd805950e2f02506d09be7e411199556d262144475b1fa46ad85250728c600c53dfd10f8b3f4adf140e27241aec3c2da3a81046703fccf468b48b145f939efdbb96c3786db712b3113bb2488ef286cdcef8afe82d200a5bb36b5462166e8ce77f2d831a52ef2135b2af188110beaefb1").unwrap();
+
+        // This one should fail in Kumquat because p256 precompile is not enabled
+        let call_message = call_p256_verify_transaction(contract_addr, &dev_signer, 1, input);
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message, call_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    // expect this call to fail because we enabled the p256 feature of revm enabled on tangerine
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap_or_default();
+    assert_eq!(storage_value, U256::from(0));
+    assert!(!receipts.last().unwrap().receipt.status());
+
+    l2_block_info.current_spec = SovSpecId::Tangerine;
+    l2_block_info.l2_height += 1;
+    l2_height += 1;
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::Tangerine, l1_fee_rate);
+
+        let input = Bytes::from_str("b5a77e7a90aa14e0bf5f337f06f597148676424fae26e175c6e5621c34351955289f319789da424845c9eac935245fcddd805950e2f02506d09be7e411199556d262144475b1fa46ad85250728c600c53dfd10f8b3f4adf140e27241aec3c2da3a81046703fccf468b48b145f939efdbb96c3786db712b3113bb2488ef286cdcef8afe82d200a5bb36b5462166e8ce77f2d831a52ef2135b2af188110beaefb1").unwrap();
+
+        // This one should fail in Kumquat because p256 precompile is not enabled
+        let call_message = call_p256_verify_transaction(contract_addr, &dev_signer, 2, input);
+
+        evm.call(
+            CallMessage {
+                txs: vec![call_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    // expect this call to succeed because we enabled the p256 feature of revm enabled on tangerine
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap_or_default();
+    assert_eq!(storage_value, U256::from(1));
+    assert!(receipts.last().unwrap().receipt.status());
+}
+
+// The schnorr precompile is disabled before tangerine, even for a valid signature, and the same
+// call succeeds once tangerine activates.
+#[test]
+fn test_schnorr_verify_activates_at_tangerine() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::Kumquat);
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let mut l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::Kumquat,
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let keypair = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let message = [1; 32];
+    let signature = SECP256K1.sign_schnorr_no_aux_rand(&message, &keypair);
+    let public_key = XOnlyPublicKey::from_keypair(&keypair).0;
+    let mut input = Vec::new();
+    input.extend_from_slice(&public_key.serialize());
+    input.extend_from_slice(message.as_ref());
+    input.extend_from_slice(signature.as_ref());
+    let input = Bytes::from(input);
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::Kumquat, l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, SchnorrVerifyCallerContract::default());
+        let call_message =
+            call_schnorr_verify_transaction(contract_addr, &dev_signer, 1, input.clone());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message, call_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap_or_default();
+    assert_eq!(storage_value, U256::ZERO);
+    assert!(!receipts.last().unwrap().receipt.status());
+
+    l2_block_info.current_spec = SovSpecId::Tangerine;
+    l2_block_info.l2_height += 1;
+    l2_height += 1;
+
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::Tangerine, l1_fee_rate);
+
+        let call_message = call_schnorr_verify_transaction(contract_addr, &dev_signer, 2, input);
+
+        evm.call(
+            CallMessage {
+                txs: vec![call_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let receipts: Vec<_> = evm
+        .receipts
+        .iter(&mut working_set.accessory_state())
+        .collect();
+
+    let storage_value = evm
+        .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+        .unwrap();
+    assert_eq!(storage_value, U256::from(1));
+    assert!(receipts.last().unwrap().receipt.status());
+}
+
+#[test]
+fn test_schnorr_verify() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, _ledger_db) = get_evm(&config);
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+
+    // Deploy schnorr verify contract
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, SchnorrVerifyCallerContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+
+    let invoke_schnorr_verify_caller =
+        |evm: &mut Evm<DefaultContext>,
+         input: Vec<u8>,
+         nonce: u64,
+         l2_height: u64,
+         working_set: &mut WorkingSet<sov_state::ProverStorage>| {
+            let l2_block_info = HookL2BlockInfo {
+                l2_height,
+                pre_state_root: [10u8; 32],
+                current_spec: SovSpecId::latest(),
+                sequencer_pub_key: get_test_seq_pub_key(),
+                l1_fee_rate,
+                timestamp: 0,
+            };
+            let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+            evm.begin_l2_block_hook(&l2_block_info, working_set);
+            {
+                let call_message = call_schnorr_verify_transaction(
+                    contract_addr,
+                    &dev_signer,
+                    nonce,
+                    Bytes::from(input),
+                );
+
+                evm.call(
+                    CallMessage {
+                        txs: vec![call_message],
+                    },
+                    &context,
+                    working_set,
+                )
+                .unwrap();
+            }
+            evm.end_l2_block_hook(&l2_block_info, working_set);
+            evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+        };
+
+    // failing call
+    {
+        let keypair = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let message = [1; 32];
+        let signature = SECP256K1.sign_schnorr_no_aux_rand(&message, &keypair);
+        // wrong pubkey
+        let public_key =
+            XOnlyPublicKey::from_keypair(&Keypair::new(SECP256K1, &mut rand::thread_rng())).0;
+        let mut input = Vec::new();
+        input.extend_from_slice(&public_key.serialize());
+        input.extend_from_slice(message.as_ref());
+        input.extend_from_slice(signature.as_ref());
+
+        invoke_schnorr_verify_caller(&mut evm, input, 1, l2_height, &mut working_set);
+        l2_height += 1;
+
+        let receipts: Vec<_> = evm
+            .receipts
+            .iter(&mut working_set.accessory_state())
+            .collect();
+
+        let storage_value = evm
+            .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+            .unwrap_or_default();
+        assert_eq!(storage_value, U256::ZERO);
+        // will fail on `require(out.length == 32)` as empty bytes was returned
+        assert!(!receipts.last().unwrap().receipt.status());
+    }
+
+    // passing call
+    {
+        let keypair = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let message = [1; 32];
+        let signature = SECP256K1.sign_schnorr_no_aux_rand(&message, &keypair);
+        let public_key = XOnlyPublicKey::from_keypair(&keypair).0;
+        let mut input = Vec::new();
+        input.extend_from_slice(&public_key.serialize());
+        input.extend_from_slice(message.as_ref());
+        input.extend_from_slice(signature.as_ref());
+
+        invoke_schnorr_verify_caller(&mut evm, input, 2, l2_height, &mut working_set);
+
+        let receipts: Vec<_> = evm
+            .receipts
+            .iter(&mut working_set.accessory_state())
+            .collect();
+
+        let storage_value = evm
+            .storage_get(&contract_addr, &U256::ZERO, &mut working_set)
+            .unwrap();
+        assert_eq!(storage_value, U256::from(1));
+        assert!(receipts.last().unwrap().receipt.status());
+    }
+}
+
+#[test]
+// this test was useful when offchain code was first implemented
+// now it shouldn't even be in this file
+fn test_offchain_contract_storage_evm() {
+    let (config, dev_signer) =
+        get_evm_config(U256::from_str("100000000000000000000").unwrap(), None);
+
+    let contract_addr = dev_signer.address().create(0);
+
+    let (mut evm, mut working_set, _spec_id, ledger_db) =
+        get_evm_with_spec(&config, SovSpecId::latest());
+    let l1_fee_rate = 0;
+    let mut l2_height = 2;
+
+    // Deployed a contract in latest fork
+    let l2_block_info = HookL2BlockInfo {
+        l2_height,
+        pre_state_root: [10u8; 32],
+        current_spec: SovSpecId::latest(),
+        sequencer_pub_key: get_test_seq_pub_key(),
+        l1_fee_rate,
+        timestamp: 0,
+    };
+
+    let sender_address = generate_address::<C>("sender");
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 0, SimpleStorageContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    l2_height += 1;
+
+    //try to get it from offchain storage
+    let contract_info = evm.account_info(&contract_addr, &mut working_set);
+    let code_hash = contract_info.unwrap().code_hash.unwrap();
+
+    let cont_code = evm
+        .offchain_code
+        .get(&code_hash, &mut working_set.offchain_state())
+        .unwrap();
+
+    assert!(!cont_code.is_empty());
+
+    // compare rpc
+
+    let code = evm
+        .get_code(
+            contract_addr,
+            Some(alloy_eips::BlockId::Number(
+                alloy_eips::BlockNumberOrTag::Latest,
+            )),
+            &mut working_set,
+            &ledger_db,
+        )
+        .unwrap();
+
+    assert_eq!(code, *cont_code.original_byte_slice());
+
+    // Deploy contract in latest fork
+    evm.begin_l2_block_hook(&l2_block_info, &mut working_set);
+    {
+        let context = C::new(sender_address, l2_height, SovSpecId::latest(), l1_fee_rate);
+
+        let deploy_message =
+            create_contract_message(&dev_signer, 1, SelfDestructorContract::default());
+
+        evm.call(
+            CallMessage {
+                txs: vec![deploy_message],
+            },
+            &context,
+            &mut working_set,
+        )
+        .unwrap();
+    }
+    evm.end_l2_block_hook(&l2_block_info, &mut working_set);
+    evm.finalize_hook(&[99u8; 32], &mut working_set.accessory_state());
+
+    let contract_info = evm.account_info(&dev_signer.address().create(1), &mut working_set);
+    let code_hash = contract_info.unwrap().code_hash.unwrap();
+
+    let offchain_code = evm
+        .offchain_code
+        .get(&code_hash, &mut working_set.offchain_state());
+
+    assert!(offchain_code.is_some());
+}

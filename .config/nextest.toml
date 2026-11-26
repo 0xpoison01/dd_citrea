@@ -1,0 +1,31 @@
+[profile.default]
+slow-timeout = { period = "3m", terminate-after = 2 } # Mark slow tests after exceeding 3 minutes and times out after 6 minutes
+retries = 2 # A flaky test is retried a total of 3 times.
+
+[[profile.default.overrides]]
+filter = 'test(general_state_tests)'
+test-group = 'state-tests'
+priority = 100
+
+[test-groups.state-tests]
+max-threads = 8
+
+[[profile.default.overrides]]
+filter = 'binary_id(citrea::bitcoin_e2e)'
+test-group = 'bitcoin-e2e'
+# Instrumented coverage runs execute SP1 guests for longer than the default six minutes.
+slow-timeout = { period = "5m", terminate-after = 4 }
+priority = 90
+
+[test-groups.bitcoin-e2e]
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = 'binary_id(citrea::mock_e2e)'
+test-group = 'mock-e2e'
+# Instrumented coverage runs execute SP1 guests for longer than the default six minutes.
+slow-timeout = { period = "5m", terminate-after = 4 }
+priority = 80
+
+[test-groups.mock-e2e]
+max-threads = 15

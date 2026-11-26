@@ -1,0 +1,68 @@
+services:
+  citrea-bitcoin-testnet4:
+    image: bitcoin/bitcoin:30.0
+    container_name: bitcoin-testnet4
+    ports:
+      - "18443:18443"
+      - "18444:18444"
+    command:
+      -printtoconsole
+      -testnet4=1
+      -rest
+      -rpcbind=0.0.0.0
+      -rpcallowip=0.0.0.0/0
+      -rpcport=18443
+      -rpcuser=citrea
+      -rpcpassword=citrea
+      -server
+      -txindex=1
+    volumes:
+      - bitcoin-testnet4:/home/bitcoin/.bitcoin
+    networks:
+      - citrea-testnet-network
+
+
+  citrea-full-node:
+    depends_on:
+      - citrea-bitcoin-testnet4
+    image: chainwayxyz/citrea-full-node:latest
+    platform: linux/amd64
+    container_name: full-node
+    environment:
+      # Required: Network selection (auto-configures SEQUENCER_PUBLIC_KEY, SEQUENCER_DA_PUB_KEY, etc.)
+      - NETWORK=testnet
+      # Required: Bitcoin node connection
+      - NODE_URL=http://citrea-bitcoin-testnet4:18443/
+      - NODE_USERNAME=citrea
+      - NODE_PASSWORD=citrea
+      # Optional: Override defaults if needed
+      - TX_BACKUP_DIR=
+      - STORAGE_PATH=/mnt/task/citrea-db
+      - DB_MAX_OPEN_FILES=5000
+      - RPC_BIND_HOST=0.0.0.0
+      - RPC_BIND_PORT=8080
+      - RPC_MAX_CONNECTIONS=100
+      - RPC_MAX_REQUEST_BODY_SIZE=10485760
+      - RPC_MAX_RESPONSE_BODY_SIZE=10485760
+      - RPC_BATCH_REQUESTS_LIMIT=50
+      - RPC_ENABLE_SUBSCRIPTIONS=true
+      - RPC_MAX_SUBSCRIPTIONS_PER_CONNECTION=10
+      - INCLUDE_TX_BODY=false
+      - SYNC_BLOCKS_COUNT=10
+      - RUST_LOG=info
+      - JSON_LOGS=1
+    ports:
+      - "8080:8080"
+    volumes:
+      - citrea-full-node:/mnt/task/citrea-db
+    networks:
+      - citrea-testnet-network
+
+volumes:
+  bitcoin-testnet4:
+  citrea-full-node:
+
+
+networks:
+  citrea-testnet-network:
+    driver: bridge
